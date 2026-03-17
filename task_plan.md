@@ -56,7 +56,7 @@ cd /data/hwt/youtu-agent
 source activate youtu
 python scripts/data/process_training_free_GRPO_data.py
 
-# Step 1: 已完成 — Baseline 评估
+# Step 1: 已取消 — Baseline 评估
 python scripts/run_eval.py --config_name math/math_AIME24
 
 # Step 2: 跑 Training-Free GRPO（原版，积累经验）
