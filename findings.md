@@ -14,50 +14,79 @@
 
 4. **两次 LLM 调用目标不对齐**: Group Computation（从轨迹对比提取 insight）目标明确；Controller（维护高质量经验池）目标模糊，"高质量"的标准完全靠自然语言 prompt 描述。
 
+### Training-Free GRPO 的 4 阶段 Experience Update 流程
+
+```
+ExperienceUpdater.run(rollouts):
+  Stage 1: _single_rollout_summary()
+    - 对每条轨迹做结构化摘要
+    - 只处理 "部分正确" 的 group (0 < avg_reward < 1)
+
+  Stage 2: _group_advantage()
+    - 同一 query 的多条摘要对比（好 vs 差）
+    - 输出: A_text (语义版 group relative advantage)
+
+  Stage 3: _group_update()          ← Controller 第一步
+    - 每组 A_text vs 当前经验池
+    - LLM 决定 ADD/UPDATE/DELETE/NONE
+    - 输出: 每组的 operations
+
+  Stage 4: _batch_update()          ← Controller 第二步
+    - 汇总全 batch 的 operations
+    - LLM 合并冲突、去重
+    - Apply: 执行 ADD/UPDATE/DELETE
+    - 输出: 更新后的经验池
+```
+
+Stage 1-2 是 "Group Computation"（信号提取），Stage 3-4 是 "Controller"（经验池管理）。
+我们的工作替换的是 Stage 3-4。
+
 ### youtu-agent 架构关键接口
 
 **可复用组件**:
-- `RolloutManager(BaseBenchmark)`: 批量 rollout 执行，支持 preprocess → rollout → judge → stat 四阶段 pipeline
+- `RolloutManager(BaseBenchmark)`: 批量 rollout 执行，支持 preprocess → rollout → judge → stat
 - `EvaluationSample`: 数据容器，生命周期 init → rollout → judged
 - `SimplifiedAsyncOpenAI`: 异步 LLM 客户端
 - `ExperienceCache`: SQLModel 数据库缓存
-- `ConfigLoader`: Hydra 配置加载
+- `ConfigLoader`: Hydra 配置加载（config_path 相对于 utu/config/loader.py）
 
 **需替换组件**:
 - `ExperienceUpdater._group_update()` + `_batch_update()` → TrainedController
 - `TaskRecorder.experiences: dict[str, str]` (flat) → HierarchicalSkillBank (tree)
 
-### Training-Free GRPO 数据流（完整）
+---
 
+## 2026-03-17: youtu-agent 运行环境记录
+
+### 环境配置
+
+- **GPU 服务器路径**: `/data/hwt/youtu-agent/`
+- **Python 环境**: `youtu` conda env, Python 3.10
+- **依赖安装**: `uv sync --all-extras` + `pip install ipython matplotlib math-verify`
+- **LLM API**: DeepSeek-chat，通过中转站 `api.qingyuntop.top/v1`
+- **注意事项**:
+  - `UTU_LLM_BASE_URL` 只设到 `/v1`，不要带 `/chat/completions`（框架自动拼接）
+  - HuggingFace 数据集需要设置镜像: `export HF_ENDPOINT=https://hf-mirror.com`
+  - 数据存储在 SQLite (`test.db`)，不是本地文件
+
+### .env 配置
+
+```bash
+UTU_LLM_TYPE=chat.completions
+UTU_LLM_MODEL=deepseek-chat
+UTU_LLM_BASE_URL=https://api.qingyuntop.top/v1
+UTU_LLM_API_KEY=<key>
+UTU_DB_URL=sqlite:///test.db
 ```
-TrainingFreeGRPO.practice()
-  for epoch:
-    load_epoch_data(epoch, shuffle, truncate)
-    # → 每条 query 复制 grpo_n 次
 
-    for batch:
-      # 1. Rollout
-      RolloutManager.main(batch_idx)
-        preprocess_batch()  → 数据预处理
-        rollout_batch()     → agent 执行（并发，带 timeout/retry）
-        judge_batch()       → 验证答案正确性
-        stat_batch()        → 统计指标
-      # 输出: List[EvaluationSample] with reward
+### 已加载数据集
 
-      # 2. Experience Update (= Controller)
-      ExperienceUpdater.run(rollouts)
-        _single_rollout_summary()  → 单轨迹摘要（筛选 0<avg<1 的 group）
-        _group_advantage()         → 组内对比 → 提取 A_text
-        _group_update()            → 每组: A_text vs 经验池 → operations
-        _batch_update()            → 全 batch operations 合并 → apply
-      # 输出: 更新后的 experience dict
-
-      # 3. Cache
-      ExperienceCache.save_experiences()
-
-      # 4. Optional Eval
-      eval_rollout_manager.main()
-```
+通过 `python scripts/data/process_training_free_GRPO_data.py` 加载到 DB:
+- AIME24: AIME 2024 竞赛题
+- AIME25: AIME 2025 竞赛题
+- DAPO-Math-17k: 17k 数学题（Training-Free GRPO 的训练数据）
+- AFM_web_RL: Web agent RL 数据
+- WebWalkerQA: Web 导航问答
 
 ---
 

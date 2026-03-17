@@ -12,28 +12,70 @@
 
 ---
 
-## Phase 1: Problem Validation & Data Collection [CODE COMPLETE]
+## Phase 1: Problem Validation & Data Collection [CODE COMPLETE — 待运行]
 
 **目标**: 验证 "Controller 不稳定" 确实是问题，并收集训练数据
 
 ### Tasks
 
-- [ ] 1.1 搭建项目基础结构（config, utils, db）
-- [ ] 1.2 复用 youtu-agent 的 rollout pipeline，跑 Training-Free GRPO baseline
-- [ ] 1.3 实现 experience bank 的稳定性度量指标
-  - 经验池质量随 step 的变化曲线
-  - 单条经验的"生存周期"分析（被 ADD 后多久被 DELETE/UPDATE）
-  - Rollback 实验：每步更新后 eval，如果变差则回滚，统计回滚率
-- [ ] 1.4 在多个任务上跑 Training-Free GRPO，记录 (state, action, outcome) 数据
+- [x] 1.1 搭建项目基础结构（config, utils, skill_bank, controller）
+- [x] 1.2 集成 youtu-agent rollout pipeline（InstrumentedGRPO wrapper）
+- [x] 1.3 实现 experience bank 的稳定性度量指标（StabilityMetrics）
+  - rollback_rate: 更新导致 reward 下降的比例
+  - skill_churn: ADD+DELETE 操作占比
+  - skill_lifecycle: 单条经验的生存周期
+  - reward/bank_size trajectory
+- [x] 1.5 分析脚本（analyze_stability.py）
+  - Operation-reward 相关性（哪种操作导致 reward 下降）
+  - Bank 增长分析
+  - Experience 波动性分析
+- [ ] 1.4 在 math 任务上跑 Training-Free GRPO，记录 (state, action, outcome) 数据
   - state = (experience_bank_t, A_text)
   - action = operations (ADD/DELETE/UPDATE/NONE)
   - outcome = delta_reward (经验池更新前后的 agent 表现变化)
-- [ ] 1.5 数据分析：哪些类型的操作容易导致 reward 下降？
 
 ### Decisions
 
-- [ ] 决策 1: 用哪些任务收集数据？(math, web search, code, ...)
-- [ ] 决策 2: 稳定性度量的具体定义
+- [x] 决策 1: 用 math 任务（AIME24/DAPO-Math-17k）收集数据
+- [x] 决策 2: 稳定性度量 = rollback_rate + churn_rate + skill_lifecycle + reward_trajectory
+
+### 运行环境
+
+- GPU 服务器: `/data/hwt/youtu-agent/`
+- Python 环境: `youtu` conda env（已安装 ipython, matplotlib, math-verify）
+- LLM API: DeepSeek-chat via `api.qingyuntop.top/v1`（中转站）
+- 数据库: SQLite (`test.db`)
+- 数据已加载: AIME24, AIME25, DAPO-Math-17k, AFM_web_RL, WebWalkerQA
+- Baseline 评估: 运行中（`python scripts/run_eval.py --config_name math/math_AIME24`）（已中途取消）
+
+### How to Run (在 GPU 服务器上)
+
+```bash
+# Step 0: 已完成 — 环境配置 + 数据加载
+cd /data/hwt/youtu-agent
+source activate youtu
+python scripts/data/process_training_free_GRPO_data.py
+
+# Step 1: 已完成 — Baseline 评估
+python scripts/run_eval.py --config_name math/math_AIME24
+
+# Step 2: 跑 Training-Free GRPO（原版，积累经验）
+python scripts/run_training_free_GRPO.py --config_name math_reasoning
+
+# Step 3: 跑 Instrumented 版本（收集 transition 数据）
+cd /data/hwt/skillcontroller
+python scripts/collect_data.py \
+    --config_name math_reasoning \
+    --experiment_name math_stability_v1 \
+    --save_dir data/collected \
+    --held_out_eval \
+    --held_out_size 20
+
+# Step 4: 分析稳定性
+python scripts/analyze_stability.py \
+    --data_path data/collected/math_stability_v1_transitions.json \
+    --output_dir data/analysis
+```
 
 ---
 
@@ -43,22 +85,23 @@
 
 ### Tasks
 
-- [ ] 2.1 定义 Skill Bank 的数据结构
+- [x] 2.1 定义 Skill Bank 的数据结构（已在 Phase 1 中完成）
   - SkillNode: (id, content, level, parent_id, children_ids, metadata)
   - 层级定义: L0 Meta-Principles, L1 Domain Strategies, L2 Specific Tactics
-  - 操作空间: ADD(content, parent_id, level), UPDATE(node_id, content), DELETE(node_id), MOVE(node_id, new_parent_id)
+  - 操作空间: ADD, UPDATE, DELETE, MOVE + snapshot/restore
 - [ ] 2.2 设计检索机制
   - 给定 query，检索最相关的 skill 子树/路径
   - 可选方案: embedding-based, LLM-based, 或 hybrid
 - [ ] 2.3 设计 skill bank → prompt 的注入策略
   - 全量注入 vs 按需检索注入
   - 层级格式化（缩进、编号）
-- [ ] 2.4 实现 Hierarchical Skill Bank 模块
+- [ ] 2.4 Flat → Hierarchical 自动转换
+  - 把 Training-Free GRPO 产出的 flat experiences 自动组织成层级结构
 
 ### Decisions
 
-- [ ] 决策 3: 固定层数(3) vs 动态生长
-- [ ] 决策 4: 严格树结构 vs DAG（一条 skill 多个父节点）
+- [x] 决策 3: 固定 3 层（META_PRINCIPLE, DOMAIN_STRATEGY, SPECIFIC_TACTIC）
+- [x] 决策 4: 严格树结构（非 DAG）
 - [ ] 决策 5: 检索方案选择
 
 ---
@@ -69,9 +112,10 @@
 
 ### Tasks
 
-- [ ] 3.1 定义 Controller 的输入/输出形式化
-  - Input: (skill_bank_state, candidate_experiences)
-  - Output: (operation_type, target_node, content, level)
+- [x] 3.1 定义 Controller 接口（已在 Phase 1 中完成）
+  - Input: ControllerInput(skill_bank_snapshot, candidate_experiences, objectives)
+  - Output: ControllerOutput(actions: list[ControllerAction])
+  - ControllerAction: (operation, content, target_node_id, level, parent_id, confidence)
 - [ ] 3.2 Controller 架构设计
   - 方案 A: 小型 LM fine-tune（如 Qwen-1.5B）
   - 方案 B: LLM feature extraction + 分类头
@@ -179,19 +223,38 @@ Title: Learning to Maintain Hierarchical Skill Banks for LLM Agents
                     └─────────────────────────┘
 ```
 
+## Project Structure
+
+```
+skillcontroller/                    (独立项目)
+├── src/
+│   ├── config/base_config.py       SkillControllerConfig 等
+│   ├── skill_bank/
+│   │   ├── node.py                 SkillNode + SkillLevel (3-level enum)
+│   │   └── bank.py                 HierarchicalSkillBank (CRUD/snapshot/serialize)
+│   ├── controller/
+│   │   └── base.py                 BaseController + ControllerAction + OperationType
+│   ├── data_collection/
+│   │   ├── instrumented_grpo.py    InstrumentedGRPO (wrapper around youtu-agent)
+│   │   ├── recorder.py             TransitionRecorder + TransitionRecord
+│   │   └── stability.py            StabilityMetrics
+│   └── utils/                      seed, logger
+├── scripts/
+│   ├── collect_data.py             数据收集入口
+│   └── analyze_stability.py        稳定性分析
+├── tests/                          test_skill_bank, test_stability
+└── pyproject.toml
+
+youtu-agent/                        (上游依赖，不修改)
+├── utu/practice/                   Training-Free GRPO 实现
+├── utu/eval/                       评估 pipeline
+├── configs/                        Hydra 配置
+└── scripts/                        运行脚本
+```
+
 ## Relationship to youtu-agent
 
-复用 youtu-agent 的组件:
-- `RolloutManager` — rollout 执行
-- `BaseBenchmark` / `BaseProcesser` — 评估 pipeline
-- `EvaluationSample` — 数据模型
-- `SimplifiedAsyncOpenAI` — LLM 调用
-- `ExperienceCache` — 缓存机制
-- Verification functions (math, web)
-
-新增/替换的组件:
-- `HierarchicalSkillBank` — 替换 flat experience dict
-- `TrainedController` — 替换 LLM-based ExperienceUpdater
-- `SkillRetriever` — 新增，从 skill bank 检索相关技能
-- `ControllerTrainer` — 新增，Controller 训练 pipeline
-- `StabilityMetrics` — 新增，稳定性度量
+- 独立项目，通过 `sys.path.insert(0, youtu_agent_path)` 运行时引用
+- 复用: RolloutManager, EvaluationSample, ExperienceCache, ConfigLoader, SimplifiedAsyncOpenAI
+- 替换: ExperienceUpdater._group_update/_batch_update → TrainedController
+- 替换: flat experience dict → HierarchicalSkillBank
