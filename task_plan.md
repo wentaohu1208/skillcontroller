@@ -3,12 +3,156 @@
 ## Project Overview
 
 **Core Idea**: 当前 LLM Agent 的经验/技能管理（如 Training-Free GRPO 的 Controller）依赖 LLM prompt call，缺乏优化保证，导致经验池更新不稳定。我们提出：
-1. **Trained Controller** — 用可训练模型替代 LLM prompt call，通过下游 reward 信号学习如何稳定地管理经验池
-2. **Hierarchical Skill Bank** — 将扁平经验列表替换为层级结构（Meta-Principles → Domain Strategies → Specific Tactics），支持按需检索、分层更新
+1. **Trained Controller** — 两阶段架构：LLM 提取结构化特征 + 小模型做决策，通过下游 reward 信号学习管理策略
+2. **Hierarchical Skill Bank** — 将扁平经验列表替换为层级结构（Meta-Principles → Domain Strategies → Specific Tactics）
 
-**定位**: 这不是 Training-Free GRPO 的改进工作。Training-Free GRPO 是我们采集训练数据的工具之一。我们研究的是一个独立问题：**LLM Agent 如何持续积累和管理可复用的长期技能？**
+**定位**: 这不是 Training-Free GRPO 的改进工作。Controller 是一个**通用模块**，可插到任何经验管理框架（Training-Free GRPO、AutoSkill、Reflexion 等）上。我们研究的是独立问题：**LLM Agent 如何持续积累和管理可复用的长期技能？**
 
 **参考代码**: `/Users/wentaohu/project/youtu-agent`（Training-Free GRPO 实现）
+
+---
+
+## Core Method: Two-Phase Controller
+
+### 设计原理
+
+Training-Free GRPO 的断裂点：LLM 既负责理解语义，又负责做管理决策，但管理决策没有优化信号。我们的方案把这两件事拆开：
+
+```
+候选经验(文本) ──→ Phase A (LLM) ──→ 结构化特征(数字) ──→ Phase B (小模型) ──→ 操作决策
+                    不训练                                    训练
+                    擅长语义理解                              擅长从数据中学决策规律
+```
+
+- **Phase A: Feature Extractor (LLM, frozen)** — 把文本语义压缩成 domain-agnostic 的数字特征
+- **Phase B: Decision Model (trained, 小模型/MLP)** — 根据特征做操作决策，从 Δreward 信号中学习
+
+### Phase A 特征定义
+
+| 特征 | 来源 | 含义 |
+|------|------|------|
+| `top1_similarity` | LLM/embedding | 候选经验和 graph 中最相似节点的相似度 |
+| `top2_similarity` | LLM/embedding | 第二相似节点的相似度 |
+| `top1_node_level` | graph 查询 | 最相似节点在哪一层 |
+| `top1_relation` | LLM 判断 | same / refinement / complementary / unrelated |
+| `candidate_abstractness` | LLM 打分 0-1 | 0=具体技巧, 1=抽象原则 |
+| `graph_size` | 代码统计 | 当前 graph 节点数 |
+| `level_counts` | 代码统计 | L0/L1/L2 各多少节点 |
+| `recent_rewards` | recorder | 最近几步的 Δreward |
+| `reward_trend` | 线性回归 | reward 在涨还是在跌 |
+| `steps_since_last_add` | 代码统计 | 多久没 ADD 了 |
+| `steps_since_last_delete` | 代码统计 | 多久没 DELETE 了 |
+
+**这些特征是 domain-agnostic 的**——在 math/web search/code 上含义相同。
+
+### Phase B Decision Model
+
+输入: 特征向量（~15 维）
+输出: (operation, target_node, level)
+
+### 训练数据格式
+
+```jsonl
+{"features": {"top1_similarity": 0.65, "graph_size": 10, ...}, "action": {"operation": "ADD", "target_node": "S0", "level": 1}, "outcome": {"delta_reward": 0.05, "label": "positive"}}
+{"features": {"top1_similarity": 0.82, "graph_size": 12, ...}, "action": {"operation": "UPDATE", "target_node": "S3", "level": 1}, "outcome": {"delta_reward": -0.03, "label": "negative"}}
+```
+
+### 训练方式选项
+
+- **二分类**: 输入 features → 预测这个 action 是 positive/negative
+- **偏好学习**: 同一 graph state 下，正样本 action 优于负样本 action
+- **回归**: 直接预测 delta_reward
+
+推理时：枚举所有可能的 action，选 score 最高的。
+
+---
+
+## 冷启动 & 训练数据收集流程（基于 Training-Free GRPO）
+
+### 完整流程
+
+```
+Phase 1: 冷启动 — 获得初始 skill graph
+  Training-Free GRPO (原版, LLM Controller)
+    → flat experiences: {G0: "...", G1: "...", ..., G26: "..."}
+    → LLM 一次性分层 → 初始 skill graph（tree 结构）
+
+Phase 2: 数据收集 — 获得训练数据
+  Instrumented GRPO (带初始 skill graph)
+    → 每步: LLM Controller 做决策（同时记录 features + action + Δreward）
+    → 输出: training_data.jsonl
+
+Phase 3: 训练
+  training_data.jsonl → 训 Decision Model
+
+Phase 4: 部署 & 验证
+  用 trained Decision Model 替换 LLM Controller → 验证稳定性和 reward
+```
+
+### Phase 1 详解: 冷启动
+
+**Step 1**: 跑 Training-Free GRPO 原版
+
+```bash
+python scripts/run_training_free_GRPO.py --config_name math_reasoning
+```
+
+产出: `configs/agents/practice/math_practice_agent.yaml`（含 flat experiences G0-G26）
+
+**Step 2**: LLM 一次性把 flat → hierarchical
+
+```
+输入: 27 条 flat experiences
+LLM prompt: "请将这些经验组织成 L0(抽象原则) → L1(领域策略) → L2(具体技巧) 三层结构"
+输出: 初始 skill graph
+```
+
+示例结果：
+```
+S0 "多方法验证" (L0)
+├── S3 "组合: 枚举小案例 + 公式交叉验证" (L1)
+│   ├── S8 "Burnside: 检查 cycle 长度" (L2)
+│   └── S9 "容斥: 用补集法验证" (L2)
+├── S4 "几何: 坐标法 + 综合法双重验证" (L1)
+│   └── S10 "对称性: 先建对称坐标系" (L2)
+S1 "计算验证" (L0)
+├── S5 "Python 暴力验证" (L1)
+└── S6 "代码块自包含" (L1)
+S2 "问题分解" (L0)
+└── S7 "多约束提前合并" (L1)
+```
+
+### Phase 2 详解: 数据收集
+
+在初始 skill graph 上跑 Instrumented GRPO（更多 epochs，收集足够数据）：
+
+```bash
+python scripts/collect_data.py \
+    --config_name math_reasoning \
+    --experiment_name math_data_collection \
+    --epochs 3 --rollout_data_truncate 500 --batch_size 25 \
+    --held_out_eval --held_out_size 20
+```
+
+每个 step 记录一条 TransitionRecord，然后转换为训练数据：
+
+```
+TransitionRecord (每 step 一条)
+  → 拆成每条 operation 一个样本
+  → 对每条: LLM 提特征 + 取 action + 取 Δreward
+  → 输出一条训练样本到 training_data.jsonl
+```
+
+**注意**: Δreward 是整个 step 的整体效果，不是单条 operation 的。这是 credit assignment 的近似。
+
+### 数据量估算
+
+```
+3 epochs × (500/25) batches = 60 steps
+每 step ~10 条 operation → 600 条训练样本
+其中约一半正/一半负 → 300 对可用于偏好学习
+API 费用: ~$60-100
+```
 
 ---
 
@@ -21,18 +165,8 @@
 - [x] 1.1 搭建项目基础结构（config, utils, skill_bank, controller）
 - [x] 1.2 集成 youtu-agent rollout pipeline（InstrumentedGRPO wrapper）
 - [x] 1.3 实现 experience bank 的稳定性度量指标（StabilityMetrics）
-  - rollback_rate: 更新导致 reward 下降的比例
-  - skill_churn: ADD+DELETE 操作占比
-  - skill_lifecycle: 单条经验的生存周期
-  - reward/bank_size trajectory
 - [x] 1.5 分析脚本（analyze_stability.py）
-  - Operation-reward 相关性（哪种操作导致 reward 下降）
-  - Bank 增长分析
-  - Experience 波动性分析
-- [ ] 1.4 在 math 任务上跑 Training-Free GRPO，记录 (state, action, outcome) 数据
-  - state = (experience_bank_t, A_text)
-  - action = operations (ADD/DELETE/UPDATE/NONE)
-  - outcome = delta_reward (经验池更新前后的 agent 表现变化)
+- [ ] 1.4 在 math 任务上跑 Training-Free GRPO，记录 transition 数据
 
 ### Decisions
 
@@ -46,21 +180,19 @@
 - LLM API: DeepSeek-chat via `api.qingyuntop.top/v1`（中转站）
 - 数据库: SQLite (`test.db`)
 - 数据已加载: AIME24, AIME25, DAPO-Math-17k, AFM_web_RL, WebWalkerQA
-- Baseline 评估: 运行中（`python scripts/run_eval.py --config_name math/math_AIME24`）（已中途取消）
 
 ### How to Run (在 GPU 服务器上)
 
 ```bash
 # Step 0: 已完成 — 环境配置 + 数据加载
+
+# Step 1: 跑 Training-Free GRPO 原版（冷启动，获得 flat experiences）
 cd /data/hwt/youtu-agent
-source activate youtu
-python scripts/data/process_training_free_GRPO_data.py
-
-# Step 1: 已取消 — Baseline 评估
-python scripts/run_eval.py --config_name math/math_AIME24
-
-# Step 2: 跑 Training-Free GRPO（原版，积累经验）
 python scripts/run_training_free_GRPO.py --config_name math_reasoning
+# 产出: configs/agents/practice/math_practice_agent.yaml
+
+# Step 2: LLM 把 flat experiences → 初始 skill graph（一次性）
+# TODO: 实现 scripts/build_initial_graph.py
 
 # Step 3: 跑 Instrumented 版本（收集 transition 数据）
 cd /data/hwt/skillcontroller
@@ -68,35 +200,30 @@ python scripts/collect_data.py \
     --config_name math_reasoning \
     --experiment_name math_stability_v1 \
     --save_dir data/collected \
-    --held_out_eval \
-    --held_out_size 20
+    --held_out_eval --held_out_size 20
 
 # Step 4: 分析稳定性
 python scripts/analyze_stability.py \
     --data_path data/collected/math_stability_v1_transitions.json \
     --output_dir data/analysis
+
+# Step 5: 转换 transition → 训练数据
+# TODO: 实现 scripts/build_training_data.py
+# TransitionRecord → LLM 提特征 → training_data.jsonl
 ```
 
 ---
 
-## Phase 2: Hierarchical Skill Bank Design [NOT STARTED]
+## Phase 2: Hierarchical Skill Bank Design [PARTIALLY DONE]
 
 **目标**: 设计层级技能库的表示、存储和检索机制
 
 ### Tasks
 
-- [x] 2.1 定义 Skill Bank 的数据结构（已在 Phase 1 中完成）
-  - SkillNode: (id, content, level, parent_id, children_ids, metadata)
-  - 层级定义: L0 Meta-Principles, L1 Domain Strategies, L2 Specific Tactics
-  - 操作空间: ADD, UPDATE, DELETE, MOVE + snapshot/restore
+- [x] 2.1 定义 Skill Bank 的数据结构（SkillNode, HierarchicalSkillBank）
 - [ ] 2.2 设计检索机制
-  - 给定 query，检索最相关的 skill 子树/路径
-  - 可选方案: embedding-based, LLM-based, 或 hybrid
 - [ ] 2.3 设计 skill bank → prompt 的注入策略
-  - 全量注入 vs 按需检索注入
-  - 层级格式化（缩进、编号）
-- [ ] 2.4 Flat → Hierarchical 自动转换
-  - 把 Training-Free GRPO 产出的 flat experiences 自动组织成层级结构
+- [ ] 2.4 Flat → Hierarchical 自动转换（LLM 一次性分层）
 
 ### Decisions
 
@@ -108,30 +235,29 @@ python scripts/analyze_stability.py \
 
 ## Phase 3: Trained Controller [NOT STARTED]
 
-**目标**: 设计并训练 Controller 模型
+**目标**: 实现两阶段 Controller 并训练
 
 ### Tasks
 
-- [x] 3.1 定义 Controller 接口（已在 Phase 1 中完成）
-  - Input: ControllerInput(skill_bank_snapshot, candidate_experiences, objectives)
-  - Output: ControllerOutput(actions: list[ControllerAction])
-  - ControllerAction: (operation, content, target_node_id, level, parent_id, confidence)
-- [ ] 3.2 Controller 架构设计
-  - 方案 A: 小型 LM fine-tune（如 Qwen-1.5B）
-  - 方案 B: LLM feature extraction + 分类头
-  - 方案 C: Encoder-based model（对 skill bank 和 A_text 做 encoding）
-- [ ] 3.3 训练方案设计
-  - 路线 A: 离线监督学习（Phase 1 收集的数据，正样本=delta_reward>0）
-  - 路线 B: RL 训练（Controller 作为 agent, reward=delta_performance）
-  - 路线 C: DPO/偏好学习（好的更新 vs 差的更新配对）
-- [ ] 3.4 实现训练 pipeline
-- [ ] 3.5 实现推理 pipeline（trained controller 替换 LLM controller）
+- [x] 3.1 定义 Controller 接口（BaseController, ControllerAction）
+- [ ] 3.2 实现 Feature Extractor（Phase A）
+  - LLM 提取语义特征（similarity, relation, abstractness）
+  - 代码计算统计特征（graph_size, level_counts, reward_trend）
+- [ ] 3.3 实现 Decision Model（Phase B）
+  - 模型架构: MLP / 小 transformer
+  - 输入: ~15 维特征向量
+  - 输出: (operation, target_node, level)
+- [ ] 3.4 实现训练数据构造 pipeline
+  - TransitionRecord → 拆 operations → LLM 提特征 → training_data.jsonl
+- [ ] 3.5 实现训练 pipeline
+  - 方案: 二分类 / 偏好学习 / 回归（都实现，实验选最佳）
+- [ ] 3.6 实现推理 pipeline（trained controller 替换 LLM controller）
 
 ### Decisions
 
-- [ ] 决策 6: Controller 架构选择
-- [ ] 决策 7: 训练方案选择
-- [ ] 决策 8: Controller 的泛化策略（跨任务迁移怎么做）
+- [x] 决策 6: 两阶段架构（LLM Feature Extractor + Trained Decision Model）
+- [ ] 决策 7: Decision Model 具体架构（MLP vs 小 transformer）
+- [ ] 决策 8: 训练方式（二分类 vs 偏好学习 vs 回归）
 
 ---
 
@@ -141,23 +267,23 @@ python scripts/analyze_stability.py \
 
 ### Tasks
 
-- [ ] 4.1 单任务实验
+- [ ] 4.1 单任务实验（math）
   - Baseline: flat + LLM controller (= Training-Free GRPO)
   - Ours: hierarchical + trained controller
   - Ablation: flat + trained, hierarchical + LLM
-- [ ] 4.2 跨任务迁移实验
-  - 在 math 上训的 controller 用到 web search / code 上
-  - 证明 controller 学到的是 "如何管理知识" 而非 domain knowledge
-- [ ] 4.3 持续学习实验
-  - 长期迭代（10+ epochs）下 skill bank 的质量变化
+- [ ] 4.2 跨框架实验
+  - 同一个 trained controller 插到不同框架上
+  - Training-Free GRPO / AutoSkill / Reflexion
+  - 证明 controller 是通用模块
+- [ ] 4.3 跨任务迁移实验
+  - math 上训的 controller 用到 web search 上
+  - 证明学到的是管理策略而非 domain knowledge
+- [ ] 4.4 持续学习实验
+  - 长期迭代下 skill bank 的质量变化
   - 对比 trained vs LLM controller 的稳定性
-- [ ] 4.4 Skill Bank 分析
+- [ ] 4.5 Skill Bank 分析
   - 可视化层级结构
   - 经验的聚类/分布分析
-- [ ] 4.5 与其他方法对比
-  - Voyager-style skill library
-  - RAG-based retrieval
-  - Reflexion
 
 ### Decisions
 
@@ -174,87 +300,89 @@ python scripts/analyze_stability.py \
 Title: Learning to Maintain Hierarchical Skill Banks for LLM Agents
 
 1. Introduction
-2. Related Work (Skill Libraries, Meta-learning, In-context Learning)
+2. Related Work
+   - Skill Libraries (Voyager, SkillRL, SAGE, AutoSkill, ASG-SI)
+   - Memory Management (MemSkill, MemGPT)
+   - Training-Free GRPO, Reflexion, ExpeL
 3. Method
    3.1 Hierarchical Skill Bank
-   3.2 Trained Controller
-   3.3 Training Pipeline
+   3.2 Two-Phase Controller (Feature Extractor + Decision Model)
+   3.3 Cold Start & Training Pipeline
 4. Experiments
-   4.1 Single-task / 4.2 Cross-task / 4.3 Continual / 4.4 Analysis
+   4.1 Single-task / 4.2 Cross-framework / 4.3 Cross-task / 4.4 Continual / 4.5 Analysis
 5. Conclusion
 ```
+
+### Related Work Positioning
+
+| 方法 | Skill 表示 | 管理方式 | 层级 | Trained |
+|------|-----------|---------|------|---------|
+| Training-Free GRPO | flat dict | LLM call | No | No |
+| AutoSkill | Skill.md | LLM + 启发式 | No | No |
+| Voyager | code library | LLM + 执行验证 | No | No |
+| SkillRL | 2-level bank | LLM + 规则 | Yes | No (管理) |
+| MemSkill | memory skills | Trained selector + LLM designer | No | 部分 (选择) |
+| ASG-SI | skill graph | Verifier + contract | Yes | No |
+| **Ours** | **3-level tree** | **LLM features + trained model** | **Yes** | **Yes (管理)** |
 
 ---
 
 ## Architecture Overview
 
 ```
-                    ┌─────────────────────────┐
-                    │   Trained Controller_θ   │
-                    │                         │
-                    │  Input:                  │
-                    │  - Skill Bank (tree)     │
-                    │  - Candidate A_text      │
-                    │                         │
-                    │  Output:                 │
-                    │  - Operations on tree    │
-                    │  - (op, node, content,   │
-                    │     level)               │
-                    │                         │
-                    │  Training Signal:        │
-                    │  - Downstream Δreward    │
-                    └────────────┬────────────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │  Hierarchical Skill Bank │
-                    │                         │
-                    │  L0: Meta-Principles     │
-                    │  L1: Domain Strategies   │
-                    │  L2: Specific Tactics    │
-                    └────────────┬────────────┘
-                                 │ retrieve & inject
-                    ┌────────────▼────────────┐
-                    │     Frozen Policy LLM    │
-                    │      (Agent Rollout)     │
-                    └────────────┬────────────┘
-                                 │ reward signal
-                    ┌────────────▼────────────┐
-                    │    Reward / Verifier     │
-                    └─────────────────────────┘
+                    ┌─────────────────────────────┐
+                    │     Two-Phase Controller     │
+                    │                             │
+                    │  Phase A: LLM (frozen)       │
+                    │  候选经验 + graph → 特征向量   │
+                    │                             │
+                    │  Phase B: Decision Model (θ) │
+                    │  特征向量 → (op, node, level) │
+                    │  训练信号: Δreward            │
+                    └──────────────┬──────────────┘
+                                   │
+                    ┌──────────────▼──────────────┐
+                    │   Hierarchical Skill Bank    │
+                    │                             │
+                    │   L0: Meta-Principles        │
+                    │   L1: Domain Strategies      │
+                    │   L2: Specific Tactics       │
+                    └──────────────┬──────────────┘
+                                   │ retrieve & inject
+                    ┌──────────────▼──────────────┐
+                    │      Frozen Policy LLM       │
+                    │       (Agent Rollout)        │
+                    └──────────────┬──────────────┘
+                                   │ reward signal
+                    ┌──────────────▼──────────────┐
+                    │      Reward / Verifier       │
+                    └─────────────────────────────┘
 ```
 
 ## Project Structure
 
 ```
-skillcontroller/                    (独立项目)
+skillcontroller/
 ├── src/
-│   ├── config/base_config.py       SkillControllerConfig 等
+│   ├── config/base_config.py
 │   ├── skill_bank/
-│   │   ├── node.py                 SkillNode + SkillLevel (3-level enum)
-│   │   └── bank.py                 HierarchicalSkillBank (CRUD/snapshot/serialize)
+│   │   ├── node.py                 SkillNode + SkillLevel
+│   │   └── bank.py                 HierarchicalSkillBank
 │   ├── controller/
-│   │   └── base.py                 BaseController + ControllerAction + OperationType
+│   │   ├── base.py                 BaseController + ControllerAction
+│   │   ├── feature_extractor.py    Phase A: LLM → 特征 (TODO)
+│   │   └── decision_model.py       Phase B: 特征 → 操作 (TODO)
 │   ├── data_collection/
-│   │   ├── instrumented_grpo.py    InstrumentedGRPO (wrapper around youtu-agent)
-│   │   ├── recorder.py             TransitionRecorder + TransitionRecord
+│   │   ├── instrumented_grpo.py    InstrumentedGRPO wrapper
+│   │   ├── recorder.py             TransitionRecorder
 │   │   └── stability.py            StabilityMetrics
-│   └── utils/                      seed, logger
+│   └── utils/
 ├── scripts/
-│   ├── collect_data.py             数据收集入口
-│   └── analyze_stability.py        稳定性分析
-├── tests/                          test_skill_bank, test_stability
+│   ├── collect_data.py             数据收集
+│   ├── analyze_stability.py        稳定性分析
+│   ├── build_initial_graph.py      flat → hierarchical (TODO)
+│   ├── build_training_data.py      transition → 训练数据 (TODO)
+│   └── train_controller.py         训练 Decision Model (TODO)
+├── tests/
 └── pyproject.toml
-
-youtu-agent/                        (上游依赖，不修改)
-├── utu/practice/                   Training-Free GRPO 实现
-├── utu/eval/                       评估 pipeline
-├── configs/                        Hydra 配置
-└── scripts/                        运行脚本
 ```
-
-## Relationship to youtu-agent
-
-- 独立项目，通过 `sys.path.insert(0, youtu_agent_path)` 运行时引用
-- 复用: RolloutManager, EvaluationSample, ExperienceCache, ConfigLoader, SimplifiedAsyncOpenAI
-- 替换: ExperienceUpdater._group_update/_batch_update → TrainedController
-- 替换: flat experience dict → HierarchicalSkillBank
