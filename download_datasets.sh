@@ -2,7 +2,7 @@
 # Download all directly-available datasets from HuggingFace Mirror
 # Usage: bash download_datasets.sh
 
-set -e
+set +e
 
 export HF_ENDPOINT=https://hf-mirror.com
 SAVE_DIR="/data/hwt/hf_data"
