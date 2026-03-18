@@ -152,11 +152,12 @@ class InstrumentedGRPO:
                             captured_ops = []
                             original_batch_update = grpo.experience_updater._batch_update
 
-                            async def patched_batch_update(rec, critiques, max_retries=3):
+                            async def patched_batch_update(**kwargs):
+                                critiques = kwargs.get("critiques", [])
                                 for each in critiques:
                                     if "operations" in each:
                                         captured_ops.extend(each["operations"])
-                                return await original_batch_update(rec, critiques, max_retries)
+                                return await original_batch_update(**kwargs)
 
                             grpo.experience_updater._batch_update = patched_batch_update
                             try:
