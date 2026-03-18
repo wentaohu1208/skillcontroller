@@ -113,3 +113,47 @@ UTU_DB_URL=sqlite:///test.db
 - [ ] MemoryBank, MemGPT 等 memory management 工作
 - [ ] Meta-learning for knowledge management
 - [ ] Curriculum learning 与 skill bank 的关系
+
+---
+
+## 2026-03-18~19: AutoSkill 集成 & 数据收集
+
+### AutoSkill generic provider 的坑
+
+- `base_url` 不从环境变量读，只从 config dict 的 `url` 字段读
+- 必须在 `AutoSkillConfig.from_dict()` 的 `llm` dict 里显式传 `url` 和 `api_key`
+- 默认 `base_url` 是作者的测试服务器 `http://35.220.164.252:3888/v1`
+
+### DeepSeek 对 AutoSkill extraction prompt 的兼容性
+
+- AutoSkill 的 extraction prompt 非常长（~300 行 system prompt）
+- DeepSeek 有时不遵循 JSON schema，返回字符串数组而非对象数组
+- AutoSkill 有 repair 逻辑但不是所有情况都能兜住
+- 建议：正式收集数据时用对 JSON 遵循更好的模型（GPT-4o / Qwen）
+
+### WildChat 数据质量
+
+- 大部分对话是一问一答，没有用户给持久性约束
+- ~10-30% 的对话会触发 skill extraction
+- 需要多下载（5000 条下载 → 筛选后 ~2000 条 → ~300-600 条 transition）
+- 可以通过 rewrite/合成数据大幅提高 extraction 成功率
+
+### 训练策略确定：SFT + GRPO
+
+- **SFT warmup**: 用 AutoSkill 数据（无 reward），学基本格式和决策模式
+- **GRPO refinement**: Controller 自己生成多个决策，LLM-as-Judge 评分，self-improvement
+- 为什么不用 DPO：GRPO 能超越教师（AutoSkill）的决策质量，DPO 受限于已有数据
+- 和 Training-Free GRPO 的呼应：前者优化经验内容，后者优化管理策略
+
+### AutoSkill Pipeline 已验证的产出数据
+
+5 条 transition 成功产出，格式示例：
+```
+Step 0: bank空 → add "TrueNAS磁盘拓扑" → bank=1
+Step 1: bank=1 → merge (score=0.74) → bank=1, version bump
+Step 2: bank=1 → merge (score=0.64) → bank=1, version bump
+Step 3: bank=1 → add "Midjourney Prompt" (score=0.17) → bank=2
+Step 4: bank=2 → add "儿童韵律书" (score=0.17) → bank=3
+```
+
+action 分布: add 60%, merge 40%, discard 0%（样本太少，需要更多数据）

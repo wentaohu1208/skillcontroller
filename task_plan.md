@@ -1,388 +1,309 @@
-# SkillController: Learning to Maintain Hierarchical Skill Banks for LLM Agents
+# SkillController: Learning to Maintain Skill Banks for LLM Agents
 
 ## Project Overview
 
-**Core Idea**: 当前 LLM Agent 的经验/技能管理（如 Training-Free GRPO 的 Controller）依赖 LLM prompt call，缺乏优化保证，导致经验池更新不稳定。我们提出：
-1. **Trained Controller** — 两阶段架构：LLM 提取结构化特征 + 小模型做决策，通过下游 reward 信号学习管理策略
-2. **Hierarchical Skill Bank** — 将扁平经验列表替换为层级结构（Meta-Principles → Domain Strategies → Specific Tactics）
+**Core Idea**: 当前 LLM Agent 的 skill/experience 管理完全依赖 LLM prompt call，缺乏优化保证。我们训练一个 Controller 来稳定地管理 skill bank。
 
-**定位**: 这不是 Training-Free GRPO 的改进工作。Controller 是一个**通用模块**，可插到任何经验管理框架（Training-Free GRPO、AutoSkill、Reflexion 等）上。我们研究的是独立问题：**LLM Agent 如何持续积累和管理可复用的长期技能？**
+**训练路线**: AutoSkill 收集 SFT 数据 → SFT 训练小 LM → GRPO 自我改进
 
-**参考代码**: `/Users/wentaohu/project/youtu-agent`（Training-Free GRPO 实现）
+**定位**: Controller 是一个**通用模块**，可插到任何经验管理框架上（AutoSkill、Training-Free GRPO、Reflexion 等）。
 
 ---
 
-## Core Method: Two-Phase Controller
-
-### 设计原理
-
-Training-Free GRPO 的断裂点：LLM 既负责理解语义，又负责做管理决策，但管理决策没有优化信号。我们的方案把这两件事拆开：
+## 主线 Pipeline
 
 ```
-候选经验(文本) ──→ Phase A (LLM) ──→ 结构化特征(数字) ──→ Phase B (小模型) ──→ 操作决策
-                    不训练                                    训练
-                    擅长语义理解                              擅长从数据中学决策规律
+Phase 1: 数据收集 ← 当前在做
+  WildChat 对话 → AutoSkill → (skill_bank_state, candidate, action) transitions
+  + 合成数据 (rewrite math/coding/writing 规范)（待定）
+  → training_data_lm.jsonl
+
+Phase 2: SFT 训练
+  training_data_lm.jsonl → Fine-tune Qwen-1.5B
+  → Controller 学会基本决策模式 (add/merge/discard)
+
+Phase 3: GRPO 自我改进
+  SFT 模型生成 G 个决策 → LLM-as-Judge 评分 → Group Relative Advantage 更新
+  → Controller 超越"教师"（AutoSkill），学到更优策略
+
+Phase 4: 评估
+  → 跨框架 (AutoSkill / Training-Free GRPO / Reflexion)（待定）
+  → 跨任务 (math / web search / general chat)
+  → Multi-objective Pareto (performance vs token)
 ```
-
-- **Phase A: Feature Extractor (LLM, frozen)** — 把文本语义压缩成 domain-agnostic 的数字特征
-- **Phase B: Decision Model (trained, 小模型/MLP)** — 根据特征做操作决策，从 Δreward 信号中学习
-
-### Phase A 特征定义
-
-| 特征 | 来源 | 含义 |
-|------|------|------|
-| `top1_similarity` | LLM/embedding | 候选经验和 graph 中最相似节点的相似度 |
-| `top2_similarity` | LLM/embedding | 第二相似节点的相似度 |
-| `top1_node_level` | graph 查询 | 最相似节点在哪一层 |
-| `top1_relation` | LLM 判断 | same / refinement / complementary / unrelated |
-| `candidate_abstractness` | LLM 打分 0-1 | 0=具体技巧, 1=抽象原则 |
-| `graph_size` | 代码统计 | 当前 graph 节点数 |
-| `level_counts` | 代码统计 | L0/L1/L2 各多少节点 |
-| `recent_rewards` | recorder | 最近几步的 Δreward |
-| `reward_trend` | 线性回归 | reward 在涨还是在跌 |
-| `steps_since_last_add` | 代码统计 | 多久没 ADD 了 |
-| `steps_since_last_delete` | 代码统计 | 多久没 DELETE 了 |
-
-**这些特征是 domain-agnostic 的**——在 math/web search/code 上含义相同。
-
-### Phase B Decision Model
-
-输入: 特征向量（~15 维）
-输出: (operation, target_node, level)
-
-### 训练数据格式
-
-```jsonl
-{"features": {"top1_similarity": 0.65, "graph_size": 10, ...}, "action": {"operation": "ADD", "target_node": "S0", "level": 1}, "outcome": {"delta_reward": 0.05, "label": "positive"}}
-{"features": {"top1_similarity": 0.82, "graph_size": 12, ...}, "action": {"operation": "UPDATE", "target_node": "S3", "level": 1}, "outcome": {"delta_reward": -0.03, "label": "negative"}}
-```
-
-### 训练方式选项
-
-- **二分类**: 输入 features → 预测这个 action 是 positive/negative
-- **偏好学习**: 同一 graph state 下，正样本 action 优于负样本 action
-- **回归**: 直接预测 delta_reward
-
-推理时：枚举所有可能的 action，选 score 最高的。
 
 ---
 
-## 冷启动 & 训练数据收集流程（基于 Training-Free GRPO）
+## Phase 1: 数据收集 [进行中]
 
-### 完整流程
+### 1.1 AutoSkill Pipeline（主力数据源）✅ 代码完成
 
+**数据流**:
 ```
-Phase 1: 冷启动 — 获得初始 skill graph
-  Training-Free GRPO (原版, LLM Controller)
-    → flat experiences: {G0: "...", G1: "...", ..., G26: "..."}
-    → LLM 一次性分层 → 初始 skill graph（tree 结构）
-
-Phase 2: 数据收集 — 获得训练数据
-  Instrumented GRPO (带初始 skill graph)
-    → 每步: LLM Controller 做决策（同时记录 features + action + Δreward）
-    → 输出: training_data.jsonl
-
-Phase 3: 训练
-  training_data.jsonl → 训 Decision Model
-
-Phase 4: 部署 & 验证
-  用 trained Decision Model 替换 LLM Controller → 验证稳定性和 reward
+WildChat (HuggingFace) → prepare_wildchat.py → wildchat.jsonl
+  → collect_autoskill_data.py → InstrumentedAutoSkill → transitions.jsonl
+  → convert_to_training_data.py → training_data_lm.jsonl
 ```
 
-### Phase 1 详解: 冷启动
+**一条 SFT 训练数据**:
+```
+Input:  "Bank有1个skill: TrueNAS(v0.1.0) | 候选: TrueNAS NAS磁盘拓扑 | 最相似: TrueNAS(score=0.74) | Decide?"
+GT:     {"operation": "merge", "target_skill_id": "076a06f2..."}
+```
 
-**Step 1**: 跑 Training-Free GRPO 原版
+**已验证**: 5 条 transition 成功产出（3 add + 2 merge），格式正确。
 
+**代码位置**: `/Users/wentaohu/project/AutoSkill/skillcontroller_pipeline/`
+```
+├── instrumented_sdk.py        ✅ InstrumentedAutoSkill wrapper
+├── feature_extractor.py       ✅ 17 维 domain-agnostic 特征
+├── data_converter.py          ✅ MLP + LM 两种训练数据格式
+└── scripts/
+    ├── prepare_wildchat.py    ✅ WildChat 下载 + 语言筛选
+    ├── collect_autoskill_data.py  ✅ 批量收集 transitions
+    └── convert_to_training_data.py  ✅ 格式转换
+```
+
+**运行命令**:
 ```bash
-python scripts/run_training_free_GRPO.py --config_name math_reasoning
+cd /data/hwt/AutoSkill
+
+# Step 1: 准备数据
+python -m skillcontroller_pipeline.scripts.prepare_wildchat \
+    --num_conversations 5000 --output data/wildchat.jsonl --language English
+
+# Step 2: 收集 transitions（多次 shuffle 增加多样性）
+python -m skillcontroller_pipeline.scripts.collect_autoskill_data \
+    --input data/wildchat.jsonl \
+    --output_dir data/autoskill_transitions \
+    --num_runs 3 --shuffle \
+    --llm_model deepseek-chat \
+    --llm_url https://api.qingyuntop.top/v1 \
+    --llm_api_key <key> \
+    --embeddings_provider hashing
+
+# Step 3: 转换为训练数据 （还没跑过）
+python -m skillcontroller_pipeline.scripts.convert_to_training_data \
+    --input_dir data/autoskill_transitions \
+    --output_dir data/training_data --format both
 ```
 
-产出: `configs/agents/practice/math_practice_agent.yaml`（含 flat experiences G0-G26）
+**预期产出**: 2000 对话 × 3 runs → ~1000-2000 条 transition → ~$15-30 API
 
-**Step 2**: LLM 一次性把 flat → hierarchical
+### 1.2 合成数据扩充 [TODO]（暂时取消）
 
-```
-输入: 27 条 flat experiences
-LLM prompt: "请将这些经验组织成 L0(抽象原则) → L1(领域策略) → L2(具体技巧) 三层结构"
-输出: 初始 skill graph
-```
+WildChat 只有 ~10-30% 对话能触发 skill extraction。用 rewrite 提高成功率：
 
-示例结果：
-```
-S0 "多方法验证" (L0)
-├── S3 "组合: 枚举小案例 + 公式交叉验证" (L1)
-│   ├── S8 "Burnside: 检查 cycle 长度" (L2)
-│   └── S9 "容斥: 用补集法验证" (L2)
-├── S4 "几何: 坐标法 + 综合法双重验证" (L1)
-│   └── S10 "对称性: 先建对称坐标系" (L2)
-S1 "计算验证" (L0)
-├── S5 "Python 暴力验证" (L1)
-└── S6 "代码块自包含" (L1)
-S2 "问题分解" (L0)
-└── S7 "多约束提前合并" (L1)
-```
+| 数据源 | 方法 | 预期 |
+|--------|------|------|
+| Math 经验 (Training-Free GRPO 产出的 G0-G26) | rewrite 成对话格式 | ~27 条 |
+| Coding 规范 (PEP8, Google style guide) | rewrite 成用户约束对话 | ~50 条 |
+| 写作规范 (NeurIPS guidelines, 学术写作规范) | rewrite 成用户反馈对话 | ~100 条 |
+| LLM 合成 (8 domain × 50 条) | LLM 生成"用户给约束"的对话 | ~350 条 |
 
-### Phase 2 详解: 数据收集
+### 1.3 Training-Free GRPO 数据（补充，有 reward）[暂时取消]
 
-在初始 skill graph 上跑 Instrumented GRPO（更多 epochs，收集足够数据）：
+在 Training-Free GRPO 框架下收集的数据有 Δperformance（held-out accuracy），可用于 GRPO 阶段。
 
-```bash
-python scripts/collect_data.py \
-    --config_name math_reasoning \
-    --experiment_name math_data_collection \
-    --epochs 3 --rollout_data_truncate 500 --batch_size 25 \
-    --held_out_eval --held_out_size 20
-```
+**代码位置**: `/Users/wentaohu/project/skillcontroller/src/data_collection/`
+**状态**: InstrumentedGRPO 已实现，GPU 服务器上运行中（OOM/API 额度问题需解决）
 
-每个 step 记录一条 TransitionRecord，然后转换为训练数据：
-
-```
-TransitionRecord (每 step 一条)
-  → 拆成每条 operation 一个样本
-  → 对每条: LLM 提特征 + 取 action + 取 Δreward
-  → 输出一条训练样本到 training_data.jsonl
-```
-
-**注意**: Δreward 是整个 step 的整体效果，不是单条 operation 的。这是 credit assignment 的近似。
-
-### 数据量估算
-
-```
-3 epochs × (500/25) batches = 60 steps
-每 step ~10 条 operation → 600 条训练样本
-其中约一半正/一半负 → 300 对可用于偏好学习
-API 费用: ~$60-100
-```
+### 1.4 当前 TODO
+- [ ] 调研数据集（极度重要）
+- [ ] 充值 API → 跑 2000+ 条 WildChat
+- [ ] 实现合成数据 rewrite 脚本（暂时不做）
+- [ ] 转换为 SFT 训练格式
 
 ---
 
-## Phase 1: Problem Validation & Data Collection [CODE COMPLETE — 待运行]
+## Phase 2: SFT 训练 [NOT STARTED]
 
-**目标**: 验证 "Controller 不稳定" 确实是问题，并收集训练数据
+### 目标
 
-### Tasks
+用 AutoSkill 数据训练小 LM，学会基本的 skill bank 管理决策。
 
-- [x] 1.1 搭建项目基础结构（config, utils, skill_bank, controller）
-- [x] 1.2 集成 youtu-agent rollout pipeline（InstrumentedGRPO wrapper）
-- [x] 1.3 实现 experience bank 的稳定性度量指标（StabilityMetrics）
-- [x] 1.5 分析脚本（analyze_stability.py）
-- [ ] 1.4 在 math 任务上跑 Training-Free GRPO，记录 transition 数据
-
-### Decisions
-
-- [x] 决策 1: 用 math 任务（AIME24/DAPO-Math-17k）收集数据
-- [x] 决策 2: 稳定性度量 = rollback_rate + churn_rate + skill_lifecycle + reward_trajectory
-
-### 运行环境
-
-- GPU 服务器: `/data/hwt/youtu-agent/`
-- Python 环境: `youtu` conda env（已安装 ipython, matplotlib, math-verify）
-- LLM API: DeepSeek-chat via `api.qingyuntop.top/v1`（中转站）
-- 数据库: SQLite (`test.db`)
-- 数据已加载: AIME24, AIME25, DAPO-Math-17k, AFM_web_RL, WebWalkerQA
-
-### How to Run (在 GPU 服务器上)
-
-```bash
-# Step 0: 已完成 — 环境配置 + 数据加载
-
-# Step 1: 跑 Training-Free GRPO 原版（冷启动，获得 flat experiences）
-cd /data/hwt/youtu-agent
-python scripts/run_training_free_GRPO.py --config_name math_reasoning
-# 产出: configs/agents/practice/math_practice_agent.yaml
-
-# Step 2: LLM 把 flat experiences → 初始 skill graph（一次性）
-# TODO: 实现 scripts/build_initial_graph.py
-
-# Step 3: 跑 Instrumented 版本（收集 transition 数据）
-cd /data/hwt/skillcontroller
-python scripts/collect_data.py \
-    --config_name math_reasoning \
-    --experiment_name math_stability_v1 \
-    --save_dir data/collected \
-    --held_out_eval --held_out_size 20
-
-# Step 4: 分析稳定性
-python scripts/analyze_stability.py \
-    --data_path data/collected/math_stability_v1_transitions.json \
-    --output_dir data/analysis
-
-# Step 5: 转换 transition → 训练数据
-# TODO: 实现 scripts/build_training_data.py
-# TransitionRecord → LLM 提特征 → training_data.jsonl
-```
-
----
-
-## Phase 2: Hierarchical Skill Bank Design [PARTIALLY DONE]
-
-**目标**: 设计层级技能库的表示、存储和检索机制
-
-### Tasks
-
-- [x] 2.1 定义 Skill Bank 的数据结构（SkillNode, HierarchicalSkillBank）
-- [ ] 2.2 设计检索机制
-- [ ] 2.3 设计 skill bank → prompt 的注入策略
-- [ ] 2.4 Flat → Hierarchical 自动转换（LLM 一次性分层）
-
-### Decisions
-
-- [x] 决策 3: 固定 3 层（META_PRINCIPLE, DOMAIN_STRATEGY, SPECIFIC_TACTIC）
-- [x] 决策 4: 严格树结构（非 DAG）
-- [ ] 决策 5: 检索方案选择
-
----
-
-## Phase 3: Trained Controller [NOT STARTED]
-
-**目标**: 实现两阶段 Controller 并训练
-
-### Tasks
-
-- [x] 3.1 定义 Controller 接口（BaseController, ControllerAction）
-- [ ] 3.2 实现 Feature Extractor（Phase A）
-  - LLM 提取语义特征（similarity, relation, abstractness）
-  - 代码计算统计特征（graph_size, level_counts, reward_trend）
-- [ ] 3.3 实现 Decision Model（Phase B）
-  - 模型架构: MLP / 小 transformer
-  - 输入: ~15 维特征向量
-  - 输出: (operation, target_node, level)
-- [ ] 3.4 实现训练数据构造 pipeline
-  - TransitionRecord → 拆 operations → LLM 提特征 → training_data.jsonl
-- [ ] 3.5 实现训练 pipeline
-  - 方案: 二分类 / 偏好学习 / 回归（都实现，实验选最佳）
-- [ ] 3.6 实现推理 pipeline（trained controller 替换 LLM controller）
-
-### Decisions
-
-- [x] 决策 6: 两阶段架构（LLM Feature Extractor + Trained Decision Model）
-- [ ] 决策 7: Decision Model 具体架构（MLP vs 小 transformer）
-- [ ] 决策 8: 训练方式（二分类 vs 偏好学习 vs 回归）
-
----
-
-## Phase 4: Experiments & Evaluation [NOT STARTED]
-
-**目标**: 全面评估系统
-
-### Tasks
-
-- [ ] 4.1 单任务实验（math）
-  - Baseline: flat + LLM controller (= Training-Free GRPO)
-  - Ours: hierarchical + trained controller
-  - Ablation: flat + trained, hierarchical + LLM
-- [ ] 4.2 跨框架实验
-  - 同一个 trained controller 插到不同框架上
-  - Training-Free GRPO / AutoSkill / Reflexion
-  - 证明 controller 是通用模块
-- [ ] 4.3 跨任务迁移实验
-  - math 上训的 controller 用到 web search 上
-  - 证明学到的是管理策略而非 domain knowledge
-- [ ] 4.4 持续学习实验
-  - 长期迭代下 skill bank 的质量变化
-  - 对比 trained vs LLM controller 的稳定性
-- [ ] 4.5 Skill Bank 分析
-  - 可视化层级结构
-  - 经验的聚类/分布分析
-
-### Decisions
-
-- [ ] 决策 9: 评估指标定义
-- [ ] 决策 10: 计算预算规划
-
----
-
-## Phase 5: Paper Writing [NOT STARTED]
-
-### Proposed Structure
+### SFT 数据格式
 
 ```
-Title: Learning to Maintain Hierarchical Skill Banks for LLM Agents
+Input prompt:
+  Current Skill Bank (3 skills):
+    [sk_001] python-coding-standards (v0.1.2)
+    [sk_002] report-writing-policy (v0.1.0)
+    [sk_003] data-analysis-workflow (v0.1.0)
+
+  Candidate: "APA citation formatting: Generate APA 7th edition citations..."
+  Most Similar: report-writing-policy (score=0.71)
+
+  Decide: add, merge, or discard?
+
+Completion:
+  {"operation": "merge", "target_skill_id": "sk_002"}
+```
+
+### 训练配置
+
+```
+模型: Qwen2.5-1.5B / LLaMA-3.2-1B
+数据: ~1000-2000 条 SFT 样本
+方法: LoRA fine-tune
+GPU: 1x A800, ~2 小时
+Epochs: 1-2
+```
+
+### TODO
+
+- [ ] 选择 base model（Qwen-1.5B vs LLaMA-3.2-1B）
+- [ ] 实现 SFT 训练脚本（基于 TRL SFTTrainer）
+- [ ] 训练 + 评估 SFT 模型
+
+---
+
+## Phase 3: GRPO 自我改进 [NOT STARTED]
+
+### 为什么 GRPO 而非 DPO
+
+- DPO 需要提前配好正负对，受限于已有数据中的最好决策
+- GRPO 让模型自己探索新决策，能超越教师（AutoSkill）
+- 和 Training-Free GRPO 形成呼应：前者优化经验内容，后者优化管理策略
+
+### GRPO 流程
+
+```
+对每个输入 (skill_bank_state, candidate_skill):
+  1. Controller 生成 G=5 个决策 (temperature=0.7)
+     - 决策 1: add
+     - 决策 2: merge sk_001
+     - 决策 3: discard
+     - ...
+  2. 每个决策执行 → LLM-as-Judge eval (固定测试集)
+     - 分数: [7.8, 8.2, 7.1, 7.5, 6.9]
+  3. advantage_i = score_i - mean(scores)
+  4. 增大高 advantage 决策的概率，减小低的
+```
+
+### Eval: LLM-as-Judge
+
+```python
+def eval_skill_bank(bank, test_conversations):
+    """每个决策执行后，用固定测试集 + LLM judge 评分"""
+    for conv in test_conversations:
+        relevant_skills = retrieve(bank, conv["query"])
+        response = llm.generate(conv["query"], skills=relevant_skills)
+        score = llm_judge(conv, response)  # 0-10
+    return mean(scores)
+```
+
+### Multi-Objective Reward
+
+```
+reward = α × Δperformance - β × Δtoken_usage_normalized
+```
+
+不同 (α, β) 训出不同偏好的 Controller → Pareto front
+
+### 费用估算
+
+```
+每步: G=5 决策 × 10 题 × (生成 + judge) = 100 次 API call
+100 步: ~10000 calls ≈ $15-30
+```
+
+### TODO
+
+- [ ] 实现 LLM-as-Judge eval pipeline
+- [ ] 实现 GRPO 训练 pipeline
+- [ ] 训练 + 评估 GRPO 模型
+
+---
+
+## Phase 4: 评估 [NOT STARTED]
+
+| 实验 | 目的 |
+|------|------|
+| 单任务 (math) | trained vs LLM controller 的 accuracy + stability |
+| 跨框架 | 同一 controller 插到 AutoSkill / Training-Free GRPO / Reflexion |
+| 跨任务迁移 | math 上训 → web search / general chat 上测 |
+| 持续学习 | 长期迭代下 skill bank 质量变化 |
+| Multi-Objective Pareto | performance vs token usage 的 Pareto front |
+| 架构 Ablation | MLP 方案 vs End-to-End LM 方案 |
+
+---
+
+## Controller 架构候选（待决策）
+
+**方案 A: Two-Phase（LLM 特征 + MLP）**
+```
+候选经验 → LLM(frozen) → 17维数字特征 → MLP(trained) → 决策
+```
+- 泛化性强，训练数据少（~300 条），可解释
+- 信息损失
+
+**方案 B: End-to-End（Fine-tune 小 LM）**
+```
+skill_bank文本 + 候选经验 → Fine-tuned Qwen-1.5B → 决策JSON
+```
+- 表达力强，端到端
+- 训练数据多（~2000 条），可能 overfit
+
+**当前主线用方案 B（SFT + GRPO 天然适配 LM），方案 A 作为 ablation。**
+
+---
+
+## Related Work Positioning
+
+| 方法 | Skill 表示 | 管理方式 | Trained | Multi-Obj |
+|------|-----------|---------|---------|-----------|
+| Training-Free GRPO | flat dict | LLM call | No | No |
+| AutoSkill | Skill.md | LLM + 启发式 | No | No |
+| Voyager | code library | LLM + 验证 | No | No |
+| SkillRL | 2-level bank | LLM + 规则 | No (管理) | No |
+| MemSkill | memory skills | Trained selector | 部分 | No |
+| ASG-SI | skill graph | Verifier + contract | No | No |
+| **Ours** | **skill bank** | **SFT + GRPO trained** | **Yes** | **Yes** |
+
+---
+
+## Paper Structure
+
+```
+Title: Learning to Maintain Skill Banks for LLM Agents
 
 1. Introduction
 2. Related Work
-   - Skill Libraries (Voyager, SkillRL, SAGE, AutoSkill, ASG-SI)
-   - Memory Management (MemSkill, MemGPT)
-   - Training-Free GRPO, Reflexion, ExpeL
 3. Method
-   3.1 Hierarchical Skill Bank
-   3.2 Two-Phase Controller (Feature Extractor + Decision Model)
-   3.3 Cold Start & Training Pipeline
+   3.1 Skill Bank (flat → 可扩展到 hierarchical)
+   3.2 Controller Architecture
+   3.3 SFT on AutoSkill Data
+   3.4 GRPO Self-Improvement
+   3.5 Multi-Objective (Performance vs Token)
 4. Experiments
-   4.1 Single-task / 4.2 Cross-framework / 4.3 Cross-task / 4.4 Continual / 4.5 Analysis
+   4.1 Single-task / 4.2 Cross-framework / 4.3 Cross-task
+   4.4 Continual / 4.5 Pareto Analysis / 4.6 Ablation
 5. Conclusion
 ```
 
-### Related Work Positioning
-
-| 方法 | Skill 表示 | 管理方式 | 层级 | Trained |
-|------|-----------|---------|------|---------|
-| Training-Free GRPO | flat dict | LLM call | No | No |
-| AutoSkill | Skill.md | LLM + 启发式 | No | No |
-| Voyager | code library | LLM + 执行验证 | No | No |
-| SkillRL | 2-level bank | LLM + 规则 | Yes | No (管理) |
-| MemSkill | memory skills | Trained selector + LLM designer | No | 部分 (选择) |
-| ASG-SI | skill graph | Verifier + contract | Yes | No |
-| **Ours** | **3-level tree** | **LLM features + trained model** | **Yes** | **Yes (管理)** |
-
 ---
 
-## Architecture Overview
+## 环境 & 代码位置
 
 ```
-                    ┌─────────────────────────────┐
-                    │     Two-Phase Controller     │
-                    │                             │
-                    │  Phase A: LLM (frozen)       │
-                    │  候选经验 + graph → 特征向量   │
-                    │                             │
-                    │  Phase B: Decision Model (θ) │
-                    │  特征向量 → (op, node, level) │
-                    │  训练信号: Δreward            │
-                    └──────────────┬──────────────┘
-                                   │
-                    ┌──────────────▼──────────────┐
-                    │   Hierarchical Skill Bank    │
-                    │                             │
-                    │   L0: Meta-Principles        │
-                    │   L1: Domain Strategies      │
-                    │   L2: Specific Tactics       │
-                    └──────────────┬──────────────┘
-                                   │ retrieve & inject
-                    ┌──────────────▼──────────────┐
-                    │      Frozen Policy LLM       │
-                    │       (Agent Rollout)        │
-                    └──────────────┬──────────────┘
-                                   │ reward signal
-                    ┌──────────────▼──────────────┐
-                    │      Reward / Verifier       │
-                    └─────────────────────────────┘
+GPU 服务器: /data/hwt/
+├── AutoSkill/                    AutoSkill + 数据收集 pipeline
+│   └── skillcontroller_pipeline/ ← 我们的代码
+├── youtu-agent/                  Training-Free GRPO (补充数据源)
+└── skillcontroller/              Controller 训练代码 (待实现)
+
+LLM API: DeepSeek-chat via api.qingyuntop.top/v1
+Python: autoskill conda env (AutoSkill) / youtu conda env (GRPO)
 ```
 
-## Project Structure
+## 关键决策记录
 
-```
-skillcontroller/
-├── src/
-│   ├── config/base_config.py
-│   ├── skill_bank/
-│   │   ├── node.py                 SkillNode + SkillLevel
-│   │   └── bank.py                 HierarchicalSkillBank
-│   ├── controller/
-│   │   ├── base.py                 BaseController + ControllerAction
-│   │   ├── feature_extractor.py    Phase A: LLM → 特征 (TODO)
-│   │   └── decision_model.py       Phase B: 特征 → 操作 (TODO)
-│   ├── data_collection/
-│   │   ├── instrumented_grpo.py    InstrumentedGRPO wrapper
-│   │   ├── recorder.py             TransitionRecorder
-│   │   └── stability.py            StabilityMetrics
-│   └── utils/
-├── scripts/
-│   ├── collect_data.py             数据收集
-│   ├── analyze_stability.py        稳定性分析
-│   ├── build_initial_graph.py      flat → hierarchical (TODO)
-│   ├── build_training_data.py      transition → 训练数据 (TODO)
-│   └── train_controller.py         训练 Decision Model (TODO)
-├── tests/
-└── pyproject.toml
-```
+| # | 决策 | 状态 |
+|---|------|------|
+| 1 | 训练路线: SFT + GRPO（非 DPO） | ✅ 已确定 |
+| 2 | 主力数据源: AutoSkill (快、便宜、通用) | ✅ 已确定 |
+| 3 | Multi-objective: α × Δperf - β × Δtoken | ✅ 已确定 |
+| 4 | Controller 架构: 方案 B (End-to-End LM) 为主，方案 A (MLP) 为 ablation | ✅ 倾向，待最终确认 |
+| 5 | Base model: Qwen-1.5B vs LLaMA-3.2-1B | ⬜ 待决策 |
+| 6 | Hierarchical skill bank: 何时引入 | ⬜ 待决策（先做 flat） |

@@ -3,65 +3,70 @@
 ## Session 1: 2026-03-17 — Problem Analysis & Idea Formation
 
 ### Completed
-- [x] 分析 Training-Free GRPO 的完整代码实现（youtu-agent/utu/practice/）
+- [x] 分析 Training-Free GRPO 的完整代码实现
 - [x] 深入理解 ExperienceUpdater 的 4 阶段流程
 - [x] 识别 Controller 不稳定性的 4 个根源
-- [x] 确定研究定位：独立的 skill bank management 问题，非 Training-Free GRPO 改进
-- [x] 确定两个核心主张：Trained Controller + Hierarchical Skill Bank
-- [x] 讨论并选择叙事方向："Learning to Maintain Hierarchical Skill Banks for LLM Agents"
-- [x] 讨论训练 Controller 的可行性，确定跨任务离线训练路线
+- [x] 确定研究定位和两个核心主张
+- [x] 讨论并选择叙事方向
+- [x] 讨论训练 Controller 的可行性
 
-## Session 2: 2026-03-17 — Phase 1 Implementation
-
-### Completed
-- [x] 1.1 搭建项目基础结构
-  - `src/config/` — SkillControllerConfig, SkillBankConfig, ControllerConfig, DataCollectionConfig
-  - `src/skill_bank/` — SkillNode (3-level enum), HierarchicalSkillBank (CRUD/snapshot/restore/serialize)
-  - `src/controller/` — BaseController, ControllerAction, ControllerInput/Output, OperationType
-  - `src/utils/` — set_seed, get_logger
-- [x] 1.2 youtu-agent 集成
-  - `src/data_collection/instrumented_grpo.py` — InstrumentedGRPO wrapper
-  - `src/data_collection/recorder.py` — TransitionRecorder + TransitionRecord
-  - `scripts/collect_data.py` — 数据收集入口脚本
-- [x] 1.3 稳定性度量
-  - `src/data_collection/stability.py` — StabilityMetrics (rollback_rate, churn, lifecycle)
-- [x] 1.5 分析脚本
-  - `scripts/analyze_stability.py` — operation-reward 相关性、bank 增长、波动性分析
-- [x] Tests — test_skill_bank.py, test_stability.py
-
-## Session 3: 2026-03-17 — GPU 服务器环境配置
+## Session 2: 2026-03-17 — Phase 1 Implementation (skillcontroller)
 
 ### Completed
-- [x] GPU 服务器 (`/data/hwt/youtu-agent/`) 环境搭建
-- [x] 安装缺失依赖: ipython, matplotlib, math-verify
-- [x] 配置 .env: DeepSeek-chat via 中转站 `api.qingyuntop.top/v1`
-- [x] 修复 `UTU_LLM_BASE_URL` 路径重复问题（不要带 `/chat/completions`）
-- [x] 设置 HuggingFace 镜像（`HF_ENDPOINT=https://hf-mirror.com`）
-- [x] 数据集加载到 SQLite DB（AIME24/25, DAPO-Math-17k, AFM_web_RL, WebWalkerQA）
-- [x] 开始跑 baseline 评估（`python scripts/run_eval.py --config_name math/math_AIME24`）
+- [x] 搭建 skillcontroller 项目基础结构
+- [x] 实现 InstrumentedGRPO wrapper
+- [x] 实现 StabilityMetrics + 分析脚本
+- [x] 测试代码（test_skill_bank, test_stability）
 
-### Phase 1 Status
+## Session 3: 2026-03-17~18 — GPU 服务器环境 + Training-Free GRPO
 
-| Task | Status |
-|------|--------|
-| 1.1 项目基础结构 | ✅ Done |
-| 1.2 youtu-agent 集成 | ✅ Done |
-| 1.3 稳定性度量 | ✅ Done |
-| 1.4 Baseline 评估 | 🔄 运行中 (GPU 服务器) |
-| 1.5 跑 Training-Free GRPO 原版 | ⬜ Baseline 完成后进行 |
-| 1.6 跑 Instrumented 版本收集 transition | ⬜ 待 1.5 验证通过 |
-| 1.7 稳定性分析 | ⬜ 待数据 |
+### Completed
+- [x] GPU 服务器环境搭建（youtu conda env）
+- [x] 修复 ipython/matplotlib 依赖、URL 路径、HF 镜像
+- [x] 数据集加载到 SQLite
+- [x] Training-Free GRPO 原版跑通（math_reasoning）
+- [x] Instrumented GRPO 代码修复（patched_batch_update kwargs）
+- [x] Instrumented GRPO 在 GPU 服务器上运行（遇到 OOM/API 额度问题）
+
+## Session 4: 2026-03-18~19 — AutoSkill 数据收集 Pipeline
+
+### Completed
+- [x] 探索 AutoSkill 代码架构（client.py, maintenance.py, extraction.py）
+- [x] 实现 `skillcontroller_pipeline/` 完整 pipeline
+  - `instrumented_sdk.py` — InstrumentedAutoSkill wrapper
+  - `feature_extractor.py` — 17 维 domain-agnostic 特征
+  - `data_converter.py` — MLP + LM 两种训练数据格式
+  - `scripts/prepare_wildchat.py` — WildChat 下载 + 筛选
+  - `scripts/collect_autoskill_data.py` — 批量收集 transitions
+  - `scripts/convert_to_training_data.py` — 格式转换
+- [x] 修复 AutoSkill generic provider 的 base_url 问题
+- [x] 在 GPU 服务器上跑通 pipeline（5 条 transition 验证成功）
+  - 3 个 add + 2 个 merge，数据格式正确
+- [x] 确定训练策略：SFT warmup + GRPO refinement（非 DPO）
 
 ### Key Decisions Made
-1. **任务选择**: Math (AIME24/DAPO-Math-17k)
-2. **项目关系**: 独立项目，sys.path 引用 youtu-agent
-3. **叙事方向**: 独立问题 "skill bank management"，不是 GRPO 改进
-4. **训练路线**: 跨任务离线训练
+1. **训练策略**: SFT（AutoSkill 数据）+ GRPO（自我改进），不用 DPO
+2. **数据收集主力**: AutoSkill（快、便宜、通用），Training-Free GRPO 作为补充待定
+3. **Controller 架构**: 方案 A (LLM+MLP) 和方案 B (End-to-End LM) 都做，实验选最佳，待定
+4. **Multi-objective**: reward = α × Δperf - β × Δtoken，待定
+
+### Current Status
+
+| 组件 | 状态 |
+|------|------|
+| skillcontroller 项目结构 | ✅ Done |
+| InstrumentedGRPO (Training-Free GRPO) | ✅ 代码完成，GPU 上运行中，后续可能用不上 |
+| AutoSkill pipeline | ✅ 代码完成，已跑通验证 |
+| SFT 训练数据（AutoSkill） | ⬜ 需要加大数据量 |
+| GRPO 训练 pipeline | ⬜ 待实现 |
+| Controller 模型 | ⬜ 待实现 |
+| 评估 | ⬜ 待实现 |
 
 ### Next Steps
-- [ ] 等 baseline 评估完成，记录分数
-- [ ] 跑 Training-Free GRPO 原版（`python scripts/run_training_free_GRPO.py --config_name math_reasoning`）
-- [ ] 把 skillcontroller 代码部署到 GPU 服务器
-- [ ] 跑 Instrumented 版本收集 transition 数据
-- [ ] 运行 analyze_stability.py 分析
-- [ ] 根据分析结果推进 Phase 2/3
+- [ ] 调研哪些数据用来产生sft数据，刷什么benchmark（极度重要）
+- [ ] 充值 API → 跑 2000 条 WildChat × 3 runs 收集 AutoSkill transition
+- [ ] 实现合成数据（rewrite math/coding/writing 规范为对话格式）（暂时取消）
+- [ ] 运行 convert_to_training_data.py 产出 SFT 训练数据
+- [ ] 实现 SFT 训练 pipeline
+- [ ] 实现 LLM-as-Judge eval（GRPO 需要）
+- [ ] 实现 GRPO 训练 pipeline
