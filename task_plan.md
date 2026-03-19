@@ -522,42 +522,212 @@ WildChat 只有 ~10-30% 对话能触发 skill extraction。可用 rewrite 提高
 
 ### 目标
 
-用经过 SkillNet 质量筛选的 AutoSkill 数据训练小 LM。
+用经过 SkillNet 质量筛选的 AutoSkill 数据训练小 LM，学会 add/merge/discard 三分类决策。
 
-### SFT 数据格式
+### Base Model 选择
 
+**首选：Qwen2.5-3B-Instruct**（详见 0319night.md 调研）
+
+理由：
+- 3B 是三分类任务甜区（1.5B 可能不足，7B 对三分类过剩）
+- Qwen 系列 fine-tuning 生态最成熟（下载量最高，TRL/Unsloth/LLaMA-Factory 原生支持）
+- 32K context（bank 50 个 skill ≈ 5000 tokens，完全够）
+- Apache 2.0 许可证
+- GRPO 实战验证（DeepSeek-R1 蒸馏基于 Qwen）
+
+Ablation 备选：Qwen2.5-1.5B、Qwen2.5-7B、SmolLM3-3B
+
+### SFT 数据准备
+
+**输入**：Phase 1 产出的 `sft_positive.jsonl`（经 SkillNet 筛选的 positive transitions）
+
+**转换**：用 `convert_to_training_data.py --format lm` 转成 prompt-completion 对
+
+**数据格式**（和 Phase 1.3 一致）：
 ```
-Input prompt:
-  Current Skill Bank (3 skills):
-    [sk_001] python-coding-standards (v0.1.2) [Quality: Good]
-    [sk_002] report-writing-policy (v0.1.0) [Quality: Good]
-    [sk_003] data-analysis-workflow (v0.1.0) [Quality: Average]
+prompt:     bank(name+desc) + candidate(完整信息) + optional context
+completion: {"operation": "add/merge/discard"}
+```
 
-  Candidate: "APA citation formatting: Generate APA 7th edition citations..."
-  Candidate Quality: Good (safety=Good, completeness=Good, executability=Average, ...)
-  Most Similar: report-writing-policy (score=0.71)
+**数据量目标**：1000-1500 条（含 dropout 变体）
 
-  Decide: add, merge, or discard?
+**类别平衡**：
+```
+理想分布: add 40% / merge 40% / discard 20%
+如果不平衡: 对少数类 oversampling 或多数类 undersampling
+```
 
-Completion:
-  {"operation": "merge", "target_skill_id": "sk_002"}
+### SFT 训练实施
+
+**代码位置**：`/Users/wentaohu/project/skillcontroller/scripts/train_sft.py`（待实现）
+
+**训练框架**：TRL SFTTrainer + PEFT LoRA
+
+```python
+# train_sft.py 核心代码结构
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig
+from trl import SFTTrainer, SFTConfig
+from datasets import load_dataset
+
+# 1. 加载 base model
+model_name = "Qwen/Qwen2.5-3B-Instruct"
+model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# 2. 加载训练数据
+dataset = load_dataset("json", data_files="data/training_data/training_data_lm.jsonl")
+
+# 3. 格式化函数：prompt + completion 拼接
+def format_fn(sample):
+    return f"{sample['prompt']}\n{sample['completion']}"
+
+# 4. LoRA 配置
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+    lora_dropout=0.05,
+    task_type="CAUSAL_LM",
+)
+
+# 5. 训练配置
+sft_config = SFTConfig(
+    output_dir="./outputs/sft_controller",
+    num_train_epochs=2,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    learning_rate=2e-4,
+    max_seq_length=4096,
+    bf16=True,                    # A800 用 bf16
+    logging_steps=10,
+    save_strategy="epoch",
+    eval_strategy="epoch",
+    seed=42,
+)
+
+# 6. 训练
+trainer = SFTTrainer(
+    model=model,
+    args=sft_config,
+    train_dataset=dataset["train"],
+    eval_dataset=dataset.get("validation"),
+    peft_config=lora_config,
+    formatting_func=format_fn,
+)
+trainer.train()
+
+# 7. 保存
+trainer.save_model("./outputs/sft_controller/final")
+```
+
+**运行命令**：
+```bash
+cd /data/hwt/skillcontroller
+
+# LoRA 训练
+python scripts/train_sft.py \
+    --model_name Qwen/Qwen2.5-3B-Instruct \
+    --data_path /data/hwt/AutoSkill/data/training_data/training_data_lm.jsonl \
+    --output_dir ./outputs/sft_controller_lora \
+    --epochs 2 \
+    --batch_size 4 \
+    --lr 2e-4 \
+    --lora_r 16
+
+# Full Fine-tune（数据量 >1500 时可选）
+python scripts/train_sft.py \
+    --model_name Qwen/Qwen2.5-3B-Instruct \
+    --data_path /data/hwt/AutoSkill/data/training_data/training_data_lm.jsonl \
+    --output_dir ./outputs/sft_controller_full \
+    --epochs 2 \
+    --batch_size 4 \
+    --lr 2e-5 \
+    --full_finetune
+
+# 推理测试
+python scripts/eval_sft.py \
+    --model_path ./outputs/sft_controller/final \
+    --test_data /data/hwt/AutoSkill/data/training_data/test_data_lm.jsonl
 ```
 
 ### 训练配置
 
+**两种微调方式可选**：
+
+| | LoRA | Full Fine-tune |
+|---|---|---|
+| 训练参数量 | ~1% (r=16) | 100% |
+| 显存 (3B) | ~10GB | ~24GB |
+| 训练时间 | ~1-2 小时 | ~3-4 小时 |
+| 防 overfit | ✅ 天然正则化 | ⚠️ 数据少时容易 overfit |
+| 适合数据量 | 500-1500 条 | 1500+ 条 |
+| A800 能跑吗 | ✅ | ✅ |
+
+**推荐**：数据 <1500 条用 LoRA，>1500 条可以尝试 full fine-tune，两种都做作为 ablation。
+
 ```
-模型: Qwen2.5-1.5B / LLaMA-3.2-1B
-数据: ~1000-2000 条 SFT 样本（经 SkillNet 筛选）
-方法: LoRA fine-tune
-GPU: 1x A800, ~2 小时
-Epochs: 1-2
+Base Model:   Qwen2.5-3B-Instruct
+方法:          LoRA (r=16, alpha=32) 或 Full Fine-tune
+数据:          ~1000-1500 条 SFT 样本
+Epochs:       2
+Batch Size:   4 × 4 gradient accumulation = effective 16
+Learning Rate: LoRA: 2e-4 / Full: 2e-5
+Max Seq Len:  4096
+精度:          bf16
+GPU:          1x A800
 ```
+
+### SFT 评估
+
+**评估指标**：
+
+| 指标 | 怎么算 |
+|------|--------|
+| **Decision Accuracy** | 在 held-out test set 上的三分类准确率 |
+| **Per-class F1** | add / merge / discard 各自的 precision + recall |
+| **JSON Format Rate** | 输出合法 JSON 的比例（应该 >99%） |
+
+**评估流程**：
+
+```python
+# eval_sft.py 核心逻辑
+for sample in test_data:
+    output = model.generate(sample["prompt"], max_new_tokens=50, temperature=0)
+    predicted = json.loads(output)["operation"]
+    ground_truth = sample["action"]
+    # 统计 accuracy, per-class F1
+```
+
+**数据划分**：
+```
+总数据 ~1000 条
+  → 训练集 80%: ~800 条
+  → 验证集 10%: ~100 条（训练时 eval loss 监控）
+  → 测试集 10%: ~100 条（最终报数）
+```
+
+### Baseline 对比
+
+SFT 训完后和以下 baseline 对比：
+
+| Baseline | 方法 | 在 test set 上的 accuracy |
+|----------|------|--------------------------|
+| Random | 随机三选一 | ~33% |
+| Majority Class | 永远输出最多的那个类 | ~40% |
+| 纯阈值 (sim>0.7→merge) | 规则 | xx% |
+| AutoSkill LLM Controller | 大模型 API call | xx%（上限参考） |
+| **Ours (SFT)** | Qwen2.5-3B LoRA | **xx%** |
 
 ### TODO
 
-- [ ] 选择 base model
-- [ ] 实现 SFT 训练脚本（基于 TRL SFTTrainer）
-- [ ] 训练 + 评估 SFT 模型
+- [ ] 下载 Qwen2.5-3B-Instruct 到 GPU 服务器
+- [ ] 实现 `scripts/train_sft.py`
+- [ ] 实现 `scripts/eval_sft.py`
+- [ ] 数据划分（train/val/test 80/10/10）
+- [ ] 训练 + 评估
+- [ ] Ablation: 1.5B / 7B / SmolLM3 对比
 
 ---
 
