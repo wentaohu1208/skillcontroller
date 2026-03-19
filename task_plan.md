@@ -23,9 +23,9 @@ Phase 2: SFT 训练
 
 Phase 3: GRPO 自我改进
   SFT 模型生成 G 个决策 → eval 评分 → Group Relative Advantage 更新
-  → Controller 超越"教师"（AutoSkill），学到更优策略
+  → Controller 超越"教师"（AutoSkill），学到更优策略（这里有两个方案，这是说的是普通版）
 
-Phase 4: 评估
+Phase 4: 评估（指标待定）
   → SkillsBench / ALFWorld / WebShop（下游 agent 效果）
   → 稳定性指标（rollback rate, churn rate）
   → Multi-objective Pareto (performance vs token)
@@ -274,8 +274,8 @@ result = evaluator.evaluate(skill)
 
 **理由**:
 - 三分类对 1.5B 模型轻松，GRPO 也够用
-- 具体操作（merge 内容融合、add skill 创建）是确定性逻辑，代码做更可靠
-- 训练数据需求少（~1000 条），不需要学生成长文本
+- 具体操作（merge 内容融合、add skill 创建）是确定性逻辑，只要决策完成，就可以通过既定的方式去add/merge，代码做更可靠
+- 训练数据需求少（~1000 条）
 
 **Completion 格式（三选一）**:
 
@@ -285,24 +285,117 @@ result = evaluator.evaluate(skill)
 {"operation": "discard"}
 ```
 
+**Prompt 设计**:
+
+Prompt 分为三部分：Skill Bank 概览 + Candidate 完整信息 + 可选上下文。
+
+**(1) Skill Bank：每个 skill 只展示 name + description（一行）**
+
+```
+Current Skill Bank (4 skills):
+  [1] truenas-disk-topology: Designs disk topology and dataset layouts for TrueNAS Scale NAS systems
+  [2] midjourney-prompt: Generates imaginative Midjourney V5 text-to-image prompts
+  [3] childrens-book: Creates short rhyming children's books about animals
+  [4] wrestling-examples: Provides examples of wrestling matches with exclusion criteria
+```
+
+不展示 instructions（太长，20 个 skill 就上万 token）、不展示 tags/triggers（不通用）。name + description 足够判断候选和 bank 里哪个重复。
+
+**(2) Candidate：展示完整信息**
+
+```
+Candidate Skill:
+  Name: midjourney-creative-prompt-generation
+  Description: Generates creative Midjourney V5 prompts using artistic references
+  Instructions: # Goal\nCreate diverse prompts based on user concepts...
+  Triggers: create midjourney prompts, text-to-image prompts
+  Tags: midjourney, ai-art, prompt-generation
+  Confidence: 0.80
+```
+
+**(3) 可选上下文（Optional Context）**
+
+```
+Optional Context:
+  Most Similar: midjourney-prompt (score=0.52, v0.1.1)
+```
+
+**跨框架通用性设计**:
+
+| 字段 | 通用性 | 处理方式 |
+|------|--------|---------|
+| Bank 的 name + description | ✅ Agent Skills 行业标准 | **必需**，始终存在 |
+| Candidate 的 name + description | ✅ Agent Skills 行业标准 | **必需**，始终存在 |
+| Candidate 的 instructions | ✅ Agent Skills 行业标准（SKILL.md body） | **必需**，始终存在 |
+| Candidate 的 triggers/tags | ⚠️ AutoSkill 特有，标准里没有 | **可选**，训练时随机 dropout |
+| Candidate 的 confidence | ⚠️ AutoSkill 特有，标准里没有 | **可选**，训练时随机 dropout |
+| Most Similar (score) | ⚠️ 需要 embedding 检索 | **可选**，训练时随机 dropout |
+
+> Agent Skills 行业标准（agentskills.io，2025.10 Anthropic 发布，OpenAI Codex / ChatGPT / Claude Code 均采用）只定义了 skill 的**格式标准**（name + description + instructions），**没有定义自动管理机制**（add/merge/discard）。Anthropic 的 skill 管理完全靠人手动操作。这正是我们的 contribution——训练一个 Controller 自动做管理决策。
+
+**训练时随机 dropout**：~30% 的样本随机去掉部分可选字段，让模型学会在信息不完整时也能做决策。推理时任何框架只要整理成相同的 prompt 格式（bank 的 name+desc + candidate 的完整信息）就能直接用。（这个可以作为超参数调整）
+
+
+**为什么 Trained Controller 可能比现有启发式/LLM Controller 更好**:
+
+**1. 全局视角 vs 局部对比**
+
+AutoSkill 每次只做 pair-wise 比较（candidate vs 一个 existing skill）。我们的 Controller 看到**整个 bank 的列表**，能做全局判断：
+```
+AutoSkill: "candidate 和 sk_003 相似度 0.72 → merge"（只看一对）
+Ours:      "bank 里已经有 3 个 coding 类 skill 了，再 add 冗余度太高 → merge"（看全局）
+```
+
+**2. 从历史中学习 vs 每次 zero-shot**
+
+AutoSkill 的 LLM Controller 每次决策都是 zero-shot（没有历史信息）。我们的 Controller 通过 SFT 学到了大量历史决策 pattern，通过 GRPO 学到了"什么决策导致好结果"：
+```
+AutoSkill: 每次独立判断，不知道之前的 merge 效果好不好
+Ours:      从训练数据中学到"similarity 0.5-0.7 区间 merge 效果通常比 add 好"
+```
+
+**3. 确定性 vs 随机性**
+
+AutoSkill 的 LLM 每次 call 可能给不同答案（temperature、prompt 微变、模型版本更新）。我们的 1.5B 模型是确定性的：
+```
+AutoSkill: 同一个输入跑 10 次可能 7 次 merge、3 次 add
+Ours:      同一个输入永远同一个决策（temperature=0）
+```
+
+**4. 成本：$0 vs $0.01/次**
+
+AutoSkill 每次决策调一次大模型 API（`_judge_merge_with_llm`），有延迟有费用。我们的 1.5B 本地推理几毫秒，零 API 成本。
+
+**5. 阈值的脆弱性**
+
+纯启发式（similarity > 0.7 → merge）在边界值极其脆弱。换个 embedding 模型，0.7 的含义完全不同。我们的模型从多维信息做决策，不依赖单一阈值：
+```
+启发式: similarity = 0.69 → add, similarity = 0.71 → merge（差 0.02 导致完全不同的决策）
+Ours:   综合 bank 大小、候选描述、历史 pattern 做判断，不会因为一个数字的微小变化翻转
+```
+
+**预期结果**：我们可能在单次决策准确率上接近 AutoSkill（大模型语义理解更强），但在**稳定性、成本、一致性、跨框架通用性**上显著更好。论文的 story 是综合优势，不是单项冠军。
+
 **完整的一条训练数据（LM 格式）**:
 
 ```
 Input prompt:
   Current Skill Bank (4 skills):
-    [1] truenas-disk-topology (v0.1.2)
-    [2] midjourney-prompt (v0.1.1)
-    [3] childrens-book (v0.1.0)
-    [4] wrestling-examples (v0.1.0)
+    [1] truenas-disk-topology: Designs disk topology and dataset layouts for TrueNAS Scale NAS systems
+    [2] midjourney-prompt: Generates imaginative Midjourney V5 text-to-image prompts
+    [3] childrens-book: Creates short rhyming children's books about animals
+    [4] wrestling-examples: Provides examples of wrestling matches with exclusion criteria
 
   Candidate Skill:
     Name: midjourney-creative-prompt-generation
     Description: Generates creative Midjourney V5 prompts using artistic references
-    Confidence: 0.80
+    Instructions: # Goal\nCreate diverse prompts based on user concepts...
     Triggers: create midjourney prompts, text-to-image prompts
+    Tags: midjourney, ai-art, prompt-generation
+    Confidence: 0.80
 
-  Most Similar Existing Skills:
-    midjourney-prompt (score=0.52, v0.1.1)
+  Optional Context:
+    Most Similar: midjourney-prompt (score=0.52, v0.1.1)
 
   Decide: add, merge, or discard?
 
@@ -470,35 +563,211 @@ Epochs: 1-2
 
 ## Phase 3: GRPO 自我改进 [NOT STARTED]
 
-### GRPO 流程
+### 设计决策：独立采样（非链式）
+
+**和常规 GRPO 一样，每步独立，bank 不实时变化。**
+
+常规 GRPO（如 DeepSeek-R1 训 math）每步输入一道独立的题目。我们的 GRPO 每步从**已收集的 transitions 里随机采样**一条 (bank_snapshot, candidate)，互相独立。不做链式更新（一步错步步错的问题）。
+
+### GRPO 数据来源
+
+**直接复用 Phase 1 收集的 transitions**，每条 transition 里有：
+- `skill_bank_before`：bank 快照（作为 prompt 的 bank 部分）
+- `candidate`：候选 skill（作为 prompt 的 candidate 部分）
+- `action`：AutoSkill 的决策（作为 reward 计算的参考）
+- `label`：SkillNet 筛选的 positive/negative（作为 reward 信号）
+
+**不需要新数据，不需要实时提取 skill，不需要实际执行 add/merge。**
+
+### GRPO 一步的完整过程
 
 ```
-对每个输入 (skill_bank_state, candidate_skill):
-  1. Controller 生成 G=5 个决策 (temperature=0.7)
-  2. 每个决策执行 → eval 评分
-  3. advantage_i = score_i - mean(scores)
-  4. 增大高 advantage 决策的概率，减小低的
+Step 1: 随机采样一条 transition
+  bank_snapshot = [sk_001 "python-standards", sk_002 "report-writing", sk_003 "data-analysis"]
+  candidate = "code-review-policy: Enforce 2 reviewers, CI pass..."
+  gt_action = "add"（AutoSkill 的决策，经 SkillNet 筛选为 positive）
+
+Step 2: 构造 prompt（和 SFT 格式完全一样）
+  Current Skill Bank (3 skills):
+    [1] python-standards: Enforce type hints and docstrings...
+    [2] report-writing: No tables, cite all sources...
+    [3] data-analysis: Use pandas for analysis...
+
+  Candidate Skill:
+    Name: code-review-policy
+    Description: Enforce 2 reviewers, CI pass, no force push
+    Instructions: # Goal...
+
+  Decide: add, merge, or discard?
+
+Step 3: Controller 生成 G=5 个决策（temperature=0.7）
+  决策 1: {"operation": "add"}
+  决策 2: {"operation": "merge"}
+  决策 3: {"operation": "add"}
+  决策 4: {"operation": "discard"}
+  决策 5: {"operation": "merge"}
+
+Step 4: 每个决策打分（不需要实际执行）
+  决策 1 (add):     和 gt_action="add" 一致 → score = 1.0
+  决策 2 (merge):   不一致 → score = 0.3
+  决策 3 (add):     一致 → score = 1.0
+  决策 4 (discard): 不一致 → score = 0.0
+  决策 5 (merge):   不一致 → score = 0.3
+
+Step 5: Group Relative Advantage
+  mean = (1.0 + 0.3 + 1.0 + 0.0 + 0.3) / 5 = 0.52
+  advantage_1 (add):     1.0 - 0.52 = +0.48  ← 最高
+  advantage_2 (merge):   0.3 - 0.52 = -0.22
+  advantage_3 (add):     1.0 - 0.52 = +0.48
+  advantage_4 (discard): 0.0 - 0.52 = -0.52  ← 最低
+  advantage_5 (merge):   0.3 - 0.52 = -0.22
+
+Step 6: Policy Update
+  add 概率增大，discard 概率减小
 ```
 
-### Eval 信号来源（按优先级）
+### Reward 设计
 
-| 方式 | 信号质量 | 成本 |
-|------|---------|------|
-| SkillsBench pytest | 最高（ground truth） | 高（需跑 agent + Docker） |
-| SkillNet evaluate() | 中（skill 质量，非决策质量） | 低（1 次 LLM call） |
-| LLM-as-Judge | 中 | 中（每步 ~100 次 call） |
+**基础 reward：和 GT 决策对比**
 
-### Multi-Objective Reward
+```python
+def compute_reward(decision, transition):
+    gt = transition["action"]
+    label = transition["label"]  # positive or negative
+
+    if label == "positive":
+        # GT 是好决策，和 GT 一致得高分
+        return 1.0 if decision == gt else 0.0
+    elif label == "negative":
+        # GT 是坏决策，和 GT 不一致反而得高分
+        return 0.0 if decision == gt else 0.5
+```
+
+**进阶 reward：结合 similarity 的细粒度打分**
+
+```python
+def compute_reward(decision, transition):
+    similar = transition["similar_hits"]
+    top1_sim = similar[0]["score"] if similar else 0
+
+    if decision == "merge" and top1_sim > 0.5:
+        return 1.0   # 高相似度时 merge 好
+    elif decision == "add" and top1_sim < 0.3:
+        return 1.0   # 低相似度时 add 好
+    elif decision == "discard" and transition.get("skill_quality", {}).get("is_high_quality") == False:
+        return 1.0   # 低质量 skill 被 discard 好
+    elif decision == "add" and top1_sim > 0.7:
+        return 0.0   # 高相似度时 add 造成冗余
+    else:
+        return 0.5   # 中间情况
+```
+
+### 伪代码
+
+```python
+controller = load_sft_model("qwen-1.5b-sft")
+transitions = load_transitions("sft_positive.jsonl")  # Phase 1 的数据
+
+for epoch in range(num_epochs):
+    random.shuffle(transitions)
+    for t in transitions:
+        prompt = build_prompt(t["skill_bank_before"], t["candidate"])
+
+        # 生成 G 个决策
+        decisions = [controller.generate(prompt, temp=0.7) for _ in range(G)]
+
+        # 打分
+        scores = [compute_reward(d["operation"], t) for d in decisions]
+
+        # GRPO update
+        advantages = [s - mean(scores) for s in scores]
+        controller.grpo_update(prompt, decisions, advantages)
+```
+
+### 训练配置
 
 ```
-reward = α × Δperformance - β × Δtoken_usage_normalized
+模型: SFT 训好的 Qwen2.5-1.5B
+数据: Phase 1 的 transitions（~1000 条，每条采样 G=5 个决策）
+GPU: 1x A800, ~4-8 小时
+Epochs: 2-3
+API 费用: $0（不需要 LLM call，reward 由规则计算）
 ```
+
+### 和常规 GRPO 的对比
+
+| | 常规 GRPO (math) | 我们的 GRPO |
+|---|---|---|
+| 每步输入 | 一道数学题（独立） | 一条 transition 的 bank+candidate（独立采样） |
+| 每步输出 | 解题过程（几百 token） | add/merge/discard（几个 token） |
+| reward | 答案对不对（0/1） | 和 GT 一致 + similarity 合理性 |
+| bank 变化 | 无 | 无（用历史快照，不实时更新） |
+| 训练稳定性 | 高 | 高（每步独立） |
+
+### Phase 3b: 链式 GRPO（SAGE 风格）[可选进阶]
+
+> 参考: [SAGE: Reinforcement Learning for Self-Improving Agent with Skill Library](https://arxiv.org/abs/2512.17102)
+
+**动机**: Phase 3a（独立采样）每步独立，模型学不到"前面 add 了 3 个 coding skill，后面该 merge 而不是再 add"这种多步协同策略。链式 GRPO 让 bank 在一条 episode 里真的在变化，模型能学到 bank 演化的长期策略。
+
+**和 SAGE 的对应关系**:
+
+| SAGE | 我们的方法 |
+|------|---------|
+| Task chain（相似任务序列） | Conversation chain（WildChat 对话序列） |
+| Skill library 逐步增长 | Skill bank 逐步演化 |
+| Agent 在 task 中用 skill | Controller 决定 add/merge/discard |
+| Skill-integrated Reward | 待定 |
+| Sequential Rollout | 链式 GRPO（bank 实时更新） |
+
+**一条 Episode**:
+
+```
+初始 bank = []
+对话序列: [conv_1, conv_2, ..., conv_K]（K=20~50，从 WildChat 取连续对话）
+
+Step 1: bank=[] + candidate_1 → Controller 生成 G 个决策
+  → 选最优 → bank 更新
+
+Step 2: bank=[sk_1] + candidate_2 → Controller 生成 G 个决策
+  → 选最优 → bank 更新
+
+...
+
+Step K: bank=[sk_1,...,sk_N] + candidate_K → Controller 生成 G 个决策
+  → 选最优 → 最终 bank
+
+Episode Reward = eval(最终 bank) → 回传给整条链
+```
+
+**模型能学到的额外能力**（独立采样学不到的）:
+- bank 小的时候激进 add，大了以后保守 merge/discard
+- 同领域 skill 积累到一定数量后自动 merge
+- 长期 token efficiency 的平衡
+
+**Reward 设计**: 待定。可能的方向：
+- 只看最终 bank 质量（episode-level reward）
+- 每步 reward + 最终 reward 混合
+- Multi-objective: performance + token efficiency + stability
+
+**训练策略（三阶段递进）**:
+
+```
+Phase 2:  SFT         → 学格式和基本决策 pattern
+Phase 3a: 独立 GRPO   → 学单步最优决策（稳定）
+Phase 3b: 链式 GRPO   → 学多步协同策略（进阶，bank 演化）
+```
+
+Phase 3b 是可选的，如果 Phase 3a 效果已经够好可以跳过。
 
 ### TODO
 
-- [ ] 实现 eval pipeline（SkillNet evaluate / LLM-as-Judge / SkillsBench）
-- [ ] 实现 GRPO 训练 pipeline
-- [ ] 训练 + 评估 GRPO 模型
+- [ ] 实现 GRPO reward 函数（Phase 3a 用）
+- [ ] 实现 GRPO 训练 pipeline（基于 TRL GRPOTrainer）
+- [ ] 训练 + 评估独立 GRPO 模型（Phase 3a）
+- [ ] (可选) 实现链式 GRPO episode 构造
+- [ ] (可选) 设计链式 GRPO 的 reward
+- [ ] (可选) 训练 + 评估链式 GRPO 模型（Phase 3b）
 
 ---
 
@@ -600,7 +869,7 @@ Python: autoskill conda env / youtu conda env
 | 1 | 训练路线: SFT + GRPO（非 DPO） | ✅ 已确定 |
 | 2 | 主力数据源: AutoSkill (快、便宜、通用) | ✅ 已确定 |
 | 3 | 质量门控: SkillNet evaluate() 交错评估 | ✅ 已确定 |
-| 4 | Multi-objective: α × Δperf - β × Δtoken | ✅ 已确定 |
+| 4 | Multi-objective: α × Δperf - β × Δtoken | ⬜ 待决策 |
 | 5 | Controller 架构: 方案 B (End-to-End LM) 为主 | ✅ 倾向 |
 | 6 | Base model: Qwen-1.5B vs LLaMA-3.2-1B | ⬜ 待决策 |
 | 7 | 评估 benchmark: SkillsBench + ALFWorld + WebShop | ⬜ 待确认 |
