@@ -215,9 +215,7 @@ def _instrumented_upsert(self, cand, *, user_id, metadata):
 ```bash
 cd /data/hwt/AutoSkill
 
-# 需要 SkillNet 的 skillnet-ai 可导入
-export PYTHONPATH="/data/hwt/SkillNet/skillnet-ai/src:$PYTHONPATH"
-
+# pip install skillnet-ai（如果还没装）
 python -m skillcontroller_pipeline.scripts.label_transitions \
     --input_dir data/autoskill_transitions \
     --output_dir data/labeled_transitions \
