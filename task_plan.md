@@ -39,9 +39,10 @@ Phase 4: 评估
 
 **数据流**:
 ```
-WildChat → prepare_wildchat.py → wildchat.jsonl
-  → collect_autoskill_data.py → InstrumentedAutoSkill → transitions.jsonl
-  → convert_to_training_data.py → training_data_lm.jsonl
+Step 1: WildChat → prepare_wildchat.py → wildchat.jsonl
+Step 2: → collect_autoskill_data.py → transitions.jsonl（原始 transitions）
+Step 3: → label_transitions.py → sft_positive.jsonl（SkillNet 筛选后）
+Step 4: → convert_to_training_data.py → training_data_lm.jsonl（决策 + 具体操作）
 ```
 
 **已验证**: 5 条 transition 成功产出（3 add + 2 merge），格式正确。
@@ -125,23 +126,20 @@ Step 3: 保留 positive 的作为 SFT 数据
 
 ```python
 # 后置评估脚本（新建 scripts/label_transitions.py）
+from skillcontroller_pipeline.skill_quality_gate import evaluate_candidate, label_transition
+
 for t in transitions:
-    quality = skillnet_evaluate(t["candidate"])
-    action = t["action"]
-    similarity = t["similar_hits"][0]["score"] if t["similar_hits"] else 0
+    # SkillNet 五维度评估 + 分层门控
+    quality = evaluate_candidate(t["candidate"], evaluator)
+    # quality.is_high_quality 由三层门控决定:
+    #   Layer 1: Safety=Poor → False
+    #   Layer 2: Completeness=Poor 或 Executability=Poor → False
+    #   Layer 3: Maintainability+Cost 都 Poor → False
 
-    poor_count = count_poor(quality)
-
-    if poor_count >= 2 and action in ["add", "merge"]:
-        t["label"] = "negative"     # 加了垃圾 → 坏决策
-    elif poor_count >= 2 and action == "discard":
-        t["label"] = "positive"     # 丢了垃圾 → 好决策
-    elif poor_count < 2 and action in ["add", "merge"]:
-        t["label"] = "positive"     # 加了好 skill → 好决策
-    elif poor_count < 2 and action == "discard" and similarity > 0.7:
-        t["label"] = "positive"     # 好 skill 但已有类似 → 去重正确
-    elif poor_count < 2 and action == "discard" and similarity <= 0.7:
-        t["label"] = "negative"     # 好 skill 没重复却丢了 → 坏决策
+    # 结合质量 + 决策 + similarity 打标签
+    t["label"] = label_transition(t, quality, similarity_threshold=0.7)
+    # positive: 好决策（好skill被add/merge，垃圾被discard，重复被discard）
+    # negative: 坏决策（垃圾被add/merge，好skill无重复却被discard）
 
 sft_data = [t for t in transitions if t["label"] == "positive"]
 ```
@@ -270,7 +268,111 @@ result = evaluator.evaluate(skill)
 
 **成本估算**: 每条 transition 1 次 LLM call (~$0.005)，2000 条 ≈ $10。
 
-### 1.3 SkillNet analyze() 关系分析 [TODO — 可选]
+### 1.3 构造训练数据：纯三分类决策 [TODO — 需改 data_converter.py]
+
+**设计决策**: 模型**只输出决策（add/merge/discard）**，具体操作由 AutoSkill 已有代码执行。模型不生成任何 skill 内容。
+
+**理由**:
+- 三分类对 1.5B 模型轻松，GRPO 也够用
+- 具体操作（merge 内容融合、add skill 创建）是确定性逻辑，代码做更可靠
+- 训练数据需求少（~1000 条），不需要学生成长文本
+
+**Completion 格式（三选一）**:
+
+```json
+{"operation": "add"}
+{"operation": "merge"}
+{"operation": "discard"}
+```
+
+**完整的一条训练数据（LM 格式）**:
+
+```
+Input prompt:
+  Current Skill Bank (4 skills):
+    [1] truenas-disk-topology (v0.1.2)
+    [2] midjourney-prompt (v0.1.1)
+    [3] childrens-book (v0.1.0)
+    [4] wrestling-examples (v0.1.0)
+
+  Candidate Skill:
+    Name: midjourney-creative-prompt-generation
+    Description: Generates creative Midjourney V5 prompts using artistic references
+    Confidence: 0.80
+    Triggers: create midjourney prompts, text-to-image prompts
+
+  Most Similar Existing Skills:
+    midjourney-prompt (score=0.52, v0.1.1)
+
+  Decide: add, merge, or discard?
+
+Completion:
+  {"operation": "merge"}
+```
+
+**GT 来源**: transition 中 AutoSkill 的 `action` 字段（经 SkillNet 筛选后的 positive 样本）。
+
+**推理时的执行映射**:
+
+| Controller 输出 | 代码执行 |
+|----------------|---------|
+| `{"operation": "add"}` | 调 AutoSkill `store.upsert()` 把 candidate 原样加入 bank |
+| `{"operation": "merge"}` | 调 AutoSkill `_persist_merged()` 把 candidate 合并到 `similar_hits[0]` |
+| `{"operation": "discard"}` | 什么都不做 |
+
+**模型只做决策，执行交给代码。Controller 输出几个 token，AutoSkill 负责实际操作。**
+
+**执行层设计（训好后实现）**:
+
+```python
+class ControllerExecutor:
+    """接收 Controller 决策，调 AutoSkill 已有接口执行实际操作"""
+
+    def __init__(self, sdk: AutoSkill, user_id: str):
+        self.store = sdk.store
+        self.maintainer = sdk.maintainer
+        self.user_id = user_id
+
+    def execute(self, decision: dict, candidate, similar_hits):
+        op = decision["operation"]
+
+        if op == "add":
+            # 复用 AutoSkill 的 _create_new() 逻辑
+            new_skill = create_skill_from_candidate(candidate)
+            self.store.upsert(new_skill)
+            return new_skill
+
+        elif op == "merge":
+            # 取 most similar 作为 merge 目标
+            target = self.store.get(similar_hits[0]["skill_id"])
+            # 复用 AutoSkill 的 _persist_merged() 做内容合并 + version bump
+            merged = self.maintainer._persist_merged(target, candidate)
+            return merged
+
+        elif op == "discard":
+            return None
+```
+
+核心思路：**不自己写 merge/add 逻辑**，全部复用 AutoSkill `SkillMaintainer` 已有的方法：
+- `_create_new()` → 从 candidate 创建 Skill 对象 + 分配 UUID + 设 version 0.1.0
+- `_persist_merged()` → LLM 辅助合并 candidate 到已有 skill + version bump + 存储
+- `store.upsert()` → 持久化到 SkillBank 目录
+
+**完整推理流程**:
+
+```
+新对话进来
+  → AutoSkill LLMSkillExtractor.extract() → SkillCandidate
+  → Embedding 检索 → similar_hits
+  → 构造 prompt (bank + candidate + similar)
+  → Controller 模型推理 → {"operation": "merge"}
+  → ControllerExecutor.execute() → 调 AutoSkill 代码执行 merge
+  → Skill bank 更新
+```
+
+---
+
+### 1.4 SkillNet analyze() 关系分析 [可选]
 
 **目的**: 在整批数据收集完后，分析最终 skill bank 里 skill 之间的关系，回溯标注哪些决策对/错。
 
@@ -299,7 +401,7 @@ relationships = client.analyze(skills_dir="./final_skill_bank")
   → 标记那条 transition 为负样本
 ```
 
-### 1.4 SkillNet search() 验证 [TODO — 可选]
+### 1.5 SkillNet search() 验证 [可选]
 
 **目的**: 检查 AutoSkill 提取的 skill 在 SkillNet 的 150K+ 库里有没有类似的（社区验证过的）。
 
@@ -308,15 +410,17 @@ hits = client.search(q="python coding standards type hints", mode="vector", thre
 # 如果 SkillNet 库里有高度相似的 → 说明这个 skill 是有价值的
 ```
 
-### 1.5 合成数据扩充 [TODO — 暂时取消]
+### 1.6 合成数据扩充 [暂时取消]
 
 WildChat 只有 ~10-30% 对话能触发 skill extraction。可用 rewrite 提高成功率。
 
-### 1.6 当前 TODO
+### 1.7 当前 TODO
 
 - [ ] 充值 API → 跑 2000+ 条 WildChat
-- [ ] 集成 SkillNet evaluate() 到 InstrumentedAutoSkill（质量门控）
-- [ ] 转换为 SFT 训练格式
+- [ ] 解决 instructions 截断问题（中转站 rate limit 导致 DeepSeek 输出被截断）
+- [x] SkillNet 质量筛选代码（label_transitions.py）
+- [ ] 改造 convert_to_training_data.py：输出"决策 + 具体操作"格式（diff bank_before/after 提取 GT）
+- [ ] 运行完整 pipeline: collect → label → convert
 - [ ] (可选) 收集完后跑 SkillNet analyze() 标注正负样本
 
 ---
