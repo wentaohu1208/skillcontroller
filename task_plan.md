@@ -94,7 +94,20 @@ python -m skillcontroller_pipeline.scripts.convert_to_training_data \
 | **Maintainability** | 好不好改/组合 | 模块化 | 耦合严重 |
 | **Cost-awareness** | 费不费钱 | 不需要 API | 每次调 10 次 GPT-4 |
 
-每维度三档：**Good / Average / Poor**。Poor ≥ 2 个 → 判定为低质量 skill。（这里评判高低质量的方法有待考量，可以尝试一个多层次，带有优先级的考量）
+每维度三档：**Good / Average / Poor**。采用**分层门控**判定质量：
+
+```
+Layer 1 安全红线:   Safety = Poor → 直接不合格（不可逆风险）
+Layer 2 可用性:     Completeness = Poor 或 Executability = Poor → 不合格（agent 用不了）
+Layer 3 工程质量:   Maintainability + Cost 都 Poor → 不合格（留着没价值）
+                   单独一个 Poor → 通过（当前能用，长期可优化）
+```
+
+设计原理：
+- **Safety** 最高优先级——不安全的 skill 进了 bank，agent 执行危险操作是不可逆的
+- **Completeness + Executability** 次优先级——决定 agent 拿到 skill 后能不能用
+- **Maintainability** 单独容忍——当前能用，长期 bank 大了再清理
+- **Cost-awareness** 单独容忍——贵但有用，token 成本在 multi-objective reward 里处理
 
 **两种评估方式**:
 
